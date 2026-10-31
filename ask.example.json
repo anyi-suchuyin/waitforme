@@ -1,0 +1,11 @@
+{
+  "id": "ask-20261031-01",
+  "title": "billing 历史数据动不动",
+  "situation": "重构 billing 模块时纠结要不要保留历史订单的旧字段读取路径：动它要多两天工量和一次数据回灌，不动它就永远留着一坨旧脚本。",
+  "options": [
+    {"key": "A", "label": "稳妥重构", "tradeoff": "多2天，不动历史数据"},
+    {"key": "B", "label": "快删旧脚本", "tradeoff": "半天上线，历史订单可能读不到旧字段"}
+  ],
+  "default_if_no_answer": "A",
+  "urgency": "normal"
+}
