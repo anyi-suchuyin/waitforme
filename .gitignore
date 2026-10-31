@@ -1,0 +1,6 @@
+config.json
+logs/
+run/
+inbox/
+__pycache__/
+*.pyc
