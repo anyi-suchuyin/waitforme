@@ -6,12 +6,14 @@
 `ensure_ascii=False`），所有过程诊断走 stderr。Windows 下不 reconfigure 编码的话中文
 会乱码，上游 `tail -1 | jq` 直接失败。
 
-退出码：0 成功 / 2 业务失败（invalid、timeout、通道未配置、被限流）/ 1 程序异常。
+退出码：0 成功 / 2 业务失败（invalid、timeout、通道未配置、静默时段被拦）/ 3 用法错误
+（stdout 仍是一行 JSON：`{"status":"usage_error","reason":...}`）/ 1 程序异常。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -40,8 +42,11 @@ LOGS_DIR = HERE / "logs"
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_BUSINESS = 2
+EXIT_USAGE = 3
 
 URGENCIES = ("normal", "high")
+# 入口长度上限：正文超到企业微信 4096 字节以外就会去挤掉跳转链接，宁可在校验阶段挡下
+LIMITS = {"id": 80, "title": 40, "situation": 2000, "label": 40, "tradeoff": 200, "options": 8}
 # inbox 里的答案文件名要落到磁盘上，Windows 非法字符必须先洗掉
 SANITIZE_RE = re.compile(r"[^0-9A-Za-z._\-]+")
 
@@ -57,15 +62,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hook_host": "127.0.0.1",
     "hook_port": 8790,
     "rc_json_path": "",
-    "fallback_url": "http://10.204.69.40:8791/",
+    "fallback_url": "http://192.168.1.10:8791/",
     "stop_mode": "smart",
     "stop_min_duration_s": 120,
     "min_interval_s": 180,
     "max_per_10min": 2,
     "daily_limit": 20,
     "quiet_hours": {"start": "23:00", "end": "08:30"},
+    "dedup_window_s": 600,
     "ask_default_deadline_s": 600,
 }
+
+# `enabled` 写成字符串时也算数：`"false"/"0"/"no"/"off"` 都是关，别拿 Python 真值糊弄用户
+FALSY_STRINGS = {"false", "0", "no", "off", ""}
+
+
+def truthy(value: Any) -> bool:
+    """配置开关解析：`False`、`"false"`、`"0"`、`"no"`、`"off"` 一律算关。"""
+    if isinstance(value, str):
+        return value.strip().lower() not in FALSY_STRINGS
+    return bool(value)
 
 
 def log(message: str) -> None:
@@ -133,10 +149,13 @@ def push_message(
     urgency: str = "normal",
     channel: str | None = None,
     fingerprint_value: str | None = None,
+    reserve_id: str | None = None,
 ) -> dict[str, Any]:
-    """组装链接 → 发送 → 记推送日志。返回 `{ok, channel, status_code, error, url, ...}`。
+    """组装链接 → 发送 → 记推送结果。返回 `{ok, channel, status_code, error, url, ...}`。
 
-    `enabled:false` 时不发送，直接回 `disabled`；这不影响 hooks 的 HTTP 应答。
+    `enabled` 为假时不发送，直接回 `disabled`；这不影响 hooks 的 HTTP 应答。
+    `reserve_id` 由 hooks 在判定通过时就写好（预占额度），这里只回填结果；CLI 自己调用时
+    这里补一次 reserve + settle，保持和 gate 一样的账目。
     """
     import channels
     import linker
@@ -144,21 +163,32 @@ def push_message(
 
     links = linker.build_links(cfg)
     url = links["primary_url"]
-    if not cfg.get("enabled", True):
+    if not truthy(cfg.get("enabled", True)):
+        if reserve_id:
+            policy.cancel_reserve(cfg, reserve_id, "disabled")
         return {"ok": False, "channel": channels.resolve_channel(cfg, channel), "status_code": 0,
                 "error": "disabled", "url": url, "link_source": links["source"], "skipped": True}
 
-    result = channels.send(cfg, title, body_md, url, urgency, channel=channel)
     fp = fingerprint_value or policy.fingerprint(title, body_md)
-    try:
-        policy.record_push(cfg, kind, fp, result.get("channel", "?"), result.get("ok", False),
-                           {"status_code": result.get("status_code"), "error": result.get("error"),
-                            "title": title[:120], "link_source": links["source"]})
-    except OSError as exc:
-        log(f"[policy] 写 push_log 失败：{exc}")
+    if reserve_id is None:
+        try:
+            reserve_id = policy.reserve_push(cfg, kind, fp, urgency, {"title": title[:80]})
+        except OSError as exc:
+            log(f"[policy] 预占额度失败：{exc}")
+    own_reserve = reserve_id  # 发送结果回填到同一条预占上
+
+    result = channels.send(cfg, title, body_md, url, urgency, channel=channel)
+    if own_reserve:
+        try:
+            policy.settle_push(cfg, own_reserve, bool(result.get("ok")), result.get("channel", "?"),
+                               int(result.get("status_code") or 0), result.get("error"),
+                               {"title": title[:80], "link_source": links["source"]})
+        except OSError as exc:
+            log(f"[policy] 回填推送结果失败：{exc}")
     result["url"] = url
     result["link_source"] = links["source"]
     result["fingerprint"] = fp
+    result["reserve_id"] = own_reserve
     return result
 
 
@@ -170,8 +200,13 @@ def push_message(
 def validate_payload(raw: Any) -> tuple[dict[str, Any] | None, str]:
     """结构化决策请求的校验。返回 `(规范化 payload 或 None, 失败原因)`。
 
-    规则：id/title/situation 非空；options ≥2 且 key 唯一、label 非空；
-    `default_if_no_answer` 必须是已有 key（留空取第一个）；urgency ∈ {high, normal}。
+    规则：id/title/situation 非空且不超长；options 2~8 项、key 唯一、label 非空且不超长、
+    tradeoff 不超长；`default_if_no_answer` 必须是已有 key（留空取第一个）；
+    urgency ∈ {high, normal}。
+
+    长度上限是必须的，不是审美：整条消息要发到企业微信（正文 4096 字节），而截断又会
+    切掉末尾的跳转链接。实测 5000 字的 situation 能通过校验并组出 20KB 正文 ——
+    与其在出口赌截断策略，不如在入口就把它挡下来。
     """
     if not isinstance(raw, dict):
         return None, "payload 必须是 JSON 对象"
@@ -179,10 +214,18 @@ def validate_payload(raw: Any) -> tuple[dict[str, Any] | None, str]:
     for key in ("id", "title", "situation"):
         if not text[key]:
             return None, f"{key} 不能为空"
+    if len(text["id"]) > LIMITS["id"]:
+        return None, f"id 超长（{len(text['id'])} > {LIMITS['id']}）"
+    if len(text["title"]) > LIMITS["title"]:
+        return None, f"title 超长（{len(text['title'])} > {LIMITS['title']}），改成一句话"
+    if len(text["situation"]) > LIMITS["situation"]:
+        return None, f"situation 超长（{len(text['situation'])} > {LIMITS['situation']}），先自己摘要"
 
     options = raw.get("options")
     if not isinstance(options, list) or len(options) < 2:
         return None, "options 至少 2 项"
+    if len(options) > LIMITS["options"]:
+        return None, f"options 太多（{len(options)} > {LIMITS['options']}），手机上没法选"
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
     for index, option in enumerate(options):
@@ -190,14 +233,19 @@ def validate_payload(raw: Any) -> tuple[dict[str, Any] | None, str]:
             return None, f"options[{index}] 必须是对象"
         key = str(option.get("key") or "").strip()
         label = str(option.get("label") or "").strip()
+        tradeoff = str(option.get("tradeoff") or "").strip()
         if not key:
             return None, f"options[{index}].key 不能为空"
         if key in seen:
             return None, f"options key 重复：{key}"
         if not label:
             return None, f"options[{index}].label 不能为空"
+        if len(label) > LIMITS["label"]:
+            return None, f"options[{index}].label 超长（{len(label)} > {LIMITS['label']}）"
+        if len(tradeoff) > LIMITS["tradeoff"]:
+            return None, f"options[{index}].tradeoff 超长（{len(tradeoff)} > {LIMITS['tradeoff']}）"
         seen.add(key)
-        normalized.append({"key": key, "label": label, "tradeoff": str(option.get("tradeoff") or "").strip()})
+        normalized.append({"key": key, "label": label, "tradeoff": tradeoff})
 
     urgency = (text["urgency"] or "normal").lower()
     if urgency not in URGENCIES:
@@ -220,7 +268,7 @@ def validate_payload(raw: Any) -> tuple[dict[str, Any] | None, str]:
 
 def ask_body_md(payload: dict[str, Any], deadline_s: int | None = None) -> str:
     """把决策请求排成企业微信能读的 markdown：不用 `**`，靠引用块和换行分层次。"""
-    lines = [f"> {payload['situation']}", ""]
+    lines = [f"> 请求号：{payload['id']}", "", f"> {payload['situation']}", ""]
     for option in payload["options"]:
         lines.append(f"`{option['key']}` {option['label']}")
         if option["tradeoff"]:
@@ -241,14 +289,23 @@ def ask_body_md(payload: dict[str, Any], deadline_s: int | None = None) -> str:
 
 
 def answer_path(payload_id: str, cfg: dict[str, Any]) -> Path:
-    """`--wait` 轮询的答案文件路径：`inbox/<清洗后的 id>.answer.json`。"""
+    """`--wait` 轮询的答案文件：`inbox/<清洗后的 id>-<sha1前8位>.answer.json`。
+
+    清洗会把非 ASCII 字符全洗掉，实测 `"中文id"` 和 `"另一个中文id"` 都被洗成 `id`，
+    两个不同的请求撞同一个文件 —— 所以后缀必须带上原 id 的哈希。
+    """
     inbox = Path(str(cfg.get("inbox_dir") or INBOX_DIR))
     safe_id = SANITIZE_RE.sub("-", payload_id).strip("-") or "ask"
-    return inbox / f"{safe_id}.answer.json"
+    digest = hashlib.sha1(payload_id.encode("utf-8", errors="replace")).hexdigest()[:8]
+    return inbox / f"{safe_id}-{digest}.answer.json"
 
 
-def read_answer(path: Path) -> dict[str, Any] | None:
-    """读用户回复的文件。半截 JSON / 空文件 / 顶层不是对象都当「还没回」。"""
+def read_answer(path: Path, payload_id: str | None = None) -> dict[str, Any] | None:
+    """读用户回复的文件。半截 JSON / 空文件 / 顶层不是对象都当「还没回」。
+
+    给了 `payload_id` 就要求文件里的 `id`（或 `request_id`）与本次请求一致：
+    实测预置一份旧答案后，同 id 重发会立刻读到上一条的回答。
+    """
     try:
         raw = path.read_text(encoding="utf-8-sig", errors="replace").strip()
     except (OSError, ValueError):
@@ -259,7 +316,15 @@ def read_answer(path: Path) -> dict[str, Any] | None:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    if payload_id is not None:
+        stated = str(data.get("id") or data.get("request_id") or "").strip()
+        if stated != payload_id:
+            # 没有 id 或 id 对不上：可能是上一次请求留下的旧答案，继续等
+            log(f"[ask] 忽略不匹配的答案文件（文件里的 id={stated or '空'!r}，本次 {payload_id!r}）")
+            return None
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +368,23 @@ def cmd_link(args: argparse.Namespace) -> int:
     return emit(result, EXIT_OK)
 
 
+def quiet_block(cfg: dict[str, Any], urgency: str, force: bool, what: str) -> dict[str, Any] | None:
+    """手动命令也要过静默时段：凌晨三点的 `ask` 不该照样推到手机上。
+
+    放行条件是 `--force` 或 `urgency=="high"`；否则返回 blocked 结果交回调用方直接 emit。
+    """
+    import policy
+
+    if force or policy.urgency_overrides(urgency):
+        return None
+    if policy.in_quiet_hours(cfg):
+        quiet = cfg.get("quiet_hours") or {}
+        reason = f"quiet_hours {quiet.get('start')}-{quiet.get('end')}"
+        log(f"[{what}] 处于静默时段（{reason}），没发。确实要发就加 --force，或把 urgency 设成 high")
+        return {"status": "blocked", "reason": reason}
+    return None
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     cfg = load_config()
     urgency = args.urgency or "normal"
@@ -313,10 +395,19 @@ def cmd_send(args: argparse.Namespace) -> int:
         import linker
 
         links = linker.build_links(cfg)
-        preview = channels.build_content(title, body, links["primary_url"], urgency)
+        resolved = channels.resolve_channel(cfg, args.channel)
+        limits = channels.channel_limits(resolved)
+        preview = channels.build_content(channels.clip_title(title, limits["title_chars"]), body,
+                                         links["primary_url"], urgency, max_bytes=limits["max_bytes"])
         log("\n" + preview + "\n")
-        return emit({"status": "dry_run", "channel": channels.resolve_channel(cfg, args.channel),
-                     "url": links["primary_url"], "link_source": links["source"], "markdown": preview}, EXIT_OK)
+        return emit({"status": "dry_run", "channel": resolved,
+                     "url": links["primary_url"], "link_source": links["source"],
+                     "link_kept": links["primary_url"] in preview,
+                     "markdown_bytes": len(preview.encode("utf-8")), "markdown": preview}, EXIT_OK)
+
+    blocked = quiet_block(cfg, urgency, bool(args.force), "send")
+    if blocked:
+        return emit(blocked, EXIT_BUSINESS)
 
     result = push_message(cfg, kind="manual", title=title, body_md=body, urgency=urgency, channel=args.channel)
     ok = bool(result.get("ok"))
@@ -349,9 +440,29 @@ def cmd_ask(args: argparse.Namespace) -> int:
         import linker
 
         links = linker.build_links(cfg)
-        preview = channels.build_content(title, body_md, links["primary_url"], payload["urgency"])
+        resolved = channels.resolve_channel(cfg, args.channel)
+        limits = channels.channel_limits(resolved)
+        preview = channels.build_content(channels.clip_title(title, limits["title_chars"]), body_md,
+                                         links["primary_url"], payload["urgency"], max_bytes=limits["max_bytes"])
         log("\n" + preview + "\n")
-        return emit({"status": "dry_run", "id": payload["id"], "url": links["primary_url"], "markdown": preview}, EXIT_OK)
+        return emit({"status": "dry_run", "id": payload["id"], "channel": resolved,
+                     "url": links["primary_url"], "link_kept": links["primary_url"] in preview,
+                     "markdown_bytes": len(preview.encode("utf-8")), "markdown": preview}, EXIT_OK)
+
+    blocked = quiet_block(cfg, payload["urgency"], bool(args.force), "ask")
+    if blocked:
+        blocked["id"] = payload["id"]
+        return emit(blocked, EXIT_BUSINESS)
+
+    path = answer_path(payload["id"], cfg)
+    if args.wait and path.exists():
+        # 上一次的回答还在文件里等着被这一次误读：推送前先清掉（实测会立刻 answered 到旧选项）
+        try:
+            path.unlink()
+            log(f"[ask] 已清掉上一轮留下的同名答案文件 {path.name}")
+        except OSError as exc:
+            log(f"[ask] 清旧答案文件失败：{exc}")
+            return emit({"status": "failed", "id": payload["id"], "reason": f"stale_answer_unremovable:{exc}"}, EXIT_BUSINESS)
 
     result = push_message(cfg, kind="ask", title=title, body_md=body_md,
                           urgency=payload["urgency"], channel=args.channel)
@@ -359,9 +470,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         return emit({"status": "failed", "id": payload["id"], **{k: result.get(k) for k in ("channel", "status_code", "error", "url")}},
                     EXIT_BUSINESS)
     if not args.wait:
-        return emit({"status": "sent", "id": payload["id"], "url": result["url"], "channel": result["channel"]}, EXIT_OK)
+        return emit({"status": "sent", "id": payload["id"], "url": result["url"], "channel": result["channel"],
+                     "answer_file": str(path)}, EXIT_OK)
 
-    path = answer_path(payload["id"], cfg)
     log(f"[ask] 等回答：{path.name}，最多 {deadline_s}s（每 3s 查一次）")
     return wait_for_answer(payload, path, deadline_s, result["url"])
 
@@ -370,7 +481,7 @@ def wait_for_answer(payload: dict[str, Any], path: Path, deadline_s: int, url: s
     """轮询答案文件直到出现或超时。手机回话的唯一通道就是这个文件。"""
     started = time.time()
     while True:
-        answer = read_answer(path)
+        answer = read_answer(path, payload["id"])
         if answer is not None:
             raw_choice = str(answer.get("choice") or "").strip().upper()
             note = str(answer.get("note") or "")
@@ -403,7 +514,8 @@ def cmd_test(args: argparse.Namespace) -> int:
     import linker
 
     links = linker.build_links(cfg)
-    demo_title = "⏳ Kimi 需要你：测试通道"
+    resolved = channels.resolve_channel(cfg, channel)
+    demo_title = channels.clip_title("⏳ Kimi 需要你：测试通道", channels.channel_limits(resolved)["title_chars"])
     demo_body = "\n".join([
         "> 这是一条自检消息，用来确认通道和跳转链接都通。",
         "",
@@ -412,15 +524,22 @@ def cmd_test(args: argparse.Namespace) -> int:
         "",
         "> 回一个字母即可（默认 A）",
     ])
-    content = channels.build_content(demo_title, demo_body, links["primary_url"], "normal")
-    log("\n----- 将要发送的完整 markdown -----\n")
+    # 按目标通道的预算组消息：预览要和真发出去的一模一样，否则 `test` 就白测了
+    content = channels.build_content(demo_title, demo_body, links["primary_url"], "normal",
+                                     max_bytes=channels.channel_limits(resolved)["max_bytes"])
+    log("\n----- 将要发送的完整 markdown（已按通道上限截断与脱敏）-----\n")
     log(content)
     log("\n----- 结束 -----\n")
 
-    result: dict[str, Any] = {"status": "preview", "channel": channels.resolve_channel(cfg, channel),
+    result: dict[str, Any] = {"status": "preview", "channel": resolved,
                               "link_source": links["source"], "url": links["primary_url"],
-                              "markdown_bytes": len(content.encode("utf-8")), "markdown": content}
+                              "markdown_bytes": len(content.encode("utf-8")), "link_kept": links["primary_url"] in content,
+                              "markdown": content}
     if args.live:
+        blocked = quiet_block(cfg, "normal", bool(args.force), "test")
+        if blocked:
+            result.update(blocked)
+            return emit(result, EXIT_BUSINESS)
         sent = push_message(cfg, kind="test", title=demo_title, body_md=demo_body, urgency="normal", channel=channel)
         result["live"] = {k: sent.get(k) for k in ("ok", "channel", "status_code", "error")}
         result["status"] = "sent" if sent.get("ok") else "failed"
@@ -443,7 +562,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "pid_exists": bool(pid and linker.pid_alive(pid)),
         "pid": pid,
         "port": int(cfg.get("hook_port") or 8790),
-        "enabled": bool(cfg.get("enabled", True)),
+        "enabled": truthy(cfg.get("enabled", True)),
         "channel": str(cfg.get("channel") or "mock"),
         "today_count": policy.count_today(cfg),
         "last_push_ts": policy.last_push_ts(cfg),
@@ -456,8 +575,22 @@ def cmd_status(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+class JsonArgumentParser(argparse.ArgumentParser):
+    """用法错误也守「stdout 一行 JSON」的契约。
+
+    实测裸跑 `python waitforme.py`、缺 `--title`、`--urgency asap`、`--channel telegram`
+    四种情况，argparse 默认只往 stderr 打帮助，stdout 零行 —— 上游 `tail -1 | jq`
+    拿到的是空，还分不清是用法错还是程序没跑起来。
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        emit({"status": "usage_error", "reason": str(message)}, EXIT_USAGE)
+        raise SystemExit(EXIT_USAGE)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = JsonArgumentParser(
         prog="waitforme.py",
         description="AI 需要你时推一条带跳转链接的微信",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -476,6 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--body", default=None, help="markdown 正文（不用 **，企微不认）")
     p_send.add_argument("--urgency", choices=URGENCIES, default="normal")
     p_send.add_argument("--dry-run", action="store_true")
+    p_send.add_argument("--force", action="store_true", help="静默时段也照发")
     p_send.add_argument("--channel", choices=list(channels_choice_names()), default=None)
     p_send.set_defaults(func=cmd_send)
 
@@ -484,12 +618,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_ask.add_argument("--wait", action="store_true", help="轮询 inbox/<id>.answer.json 直到回答或超时")
     p_ask.add_argument("--deadline-s", type=int, default=None, dest="deadline_s")
     p_ask.add_argument("--dry-run", action="store_true")
+    p_ask.add_argument("--force", action="store_true", help="静默时段也照发")
     p_ask.add_argument("--channel", choices=list(channels_choice_names()), default=None)
     p_ask.set_defaults(func=cmd_ask)
 
     p_test = sub.add_parser("test", help="打印完整 markdown 消息体；--live 真发一条自检消息")
     p_test.add_argument("--mock", action="store_true", help="强制用 mock 通道")
     p_test.add_argument("--live", action="store_true")
+    p_test.add_argument("--force", action="store_true", help="静默时段也照发")
     p_test.set_defaults(func=cmd_test)
 
     p_status = sub.add_parser("status", help="服务与通道状态")

@@ -9,13 +9,14 @@
   "hook_token": "",
   "hook_host": "127.0.0.1",
   "hook_port": 8790,
-  "rc_json_path": "C:/Users/Administrator/.kimi-code/server/rc.json",
-  "fallback_url": "http://10.204.69.40:8791/",
+  "rc_json_path": "~/.kimi-code/server/rc.json",
+  "fallback_url": "http://192.168.1.10:8791/",
   "stop_mode": "smart",
   "stop_min_duration_s": 120,
   "min_interval_s": 180,
   "max_per_10min": 2,
   "daily_limit": 20,
   "quiet_hours": {"start": "23:00", "end": "08:30"},
+  "dedup_window_s": 600,
   "ask_default_deadline_s": 600
 }

@@ -20,8 +20,9 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -33,9 +34,12 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 import channels  # noqa: E402
+import hooks as hooks_module  # noqa: E402
 import linker  # noqa: E402
 import policy  # noqa: E402
 import waitforme  # noqa: E402
+
+hooks_redact = hooks_module.redact_token
 
 PASS = 0
 FAIL = 0
@@ -68,7 +72,7 @@ def make_cfg(tmp: Path, **overrides) -> dict:
     cfg["run_dir"] = str(tmp / "run")
     cfg["inbox_dir"] = str(tmp / "inbox")
     cfg["rc_json_path"] = str(tmp / "rc.json")
-    cfg["fallback_url"] = "http://10.204.69.40:8791/"
+    cfg["fallback_url"] = "http://192.168.1.10:8791/"
     cfg["hook_token"] = "test-token"
     # 静默时段设成 start==end（等于关闭），免得自测在半夜跑就全红
     cfg["quiet_hours"] = {"start": "00:00", "end": "00:00"}
@@ -135,6 +139,23 @@ def test_payload_validation() -> None:
         bad, reason = waitforme.validate_payload(raw)
         check(f"非法：{name}", bad is None and expect_keyword in reason, f"reason={reason!r}")
 
+    # === E1 另一半：入口就得挡住超长，别把截断赌在出口 ===
+    long_cases = [
+        ("title 超 40 字", {**VALID_PAYLOAD, "title": "长" * 41}, "title 超长"),
+        ("situation 超 2000 字", {**VALID_PAYLOAD, "situation": "情" * 2001}, "situation 超长"),
+        ("tradeoff 超 200 字", {**VALID_PAYLOAD, "options": [
+            {"key": "A", "label": "a", "tradeoff": "代" * 201}, {"key": "B", "label": "b"}]}, "tradeoff 超长"),
+        ("options 超过 8 项", {**VALID_PAYLOAD, "options": [{"key": chr(65 + i), "label": f"选{i}"} for i in range(9)]}, "options 太多"),
+        ("id 超 80 字", {**VALID_PAYLOAD, "id": "x" * 81}, "id 超长"),
+        ("label 超 40 字", {**VALID_PAYLOAD, "options": [
+            {"key": "A", "label": "标" * 41}, {"key": "B", "label": "b"}]}, "label 超长"),
+    ]
+    for name, raw, keyword in long_cases:
+        bad, reason = waitforme.validate_payload(raw)
+        check(f"非法：{name}", bad is None and keyword in reason, f"reason={reason!r}")
+    ok_len, _ = waitforme.validate_payload({**VALID_PAYLOAD, "title": "长" * 40, "situation": "情" * 2000})
+    check("刚好在上限内仍通过", ok_len is not None)
+
     # default_if_no_answer 留空 → 取第一个
     payload, _ = waitforme.validate_payload({**VALID_PAYLOAD, "default_if_no_answer": ""})
     check("default 留空取第一项", payload is not None and payload["default_if_no_answer"] == "A", str(payload))
@@ -166,13 +187,27 @@ def test_markdown() -> None:
     check("high 标题加红点", channels.build_content("t", "b", "u", "high").startswith("### 🔴"))
     no_url = channels.build_content("t", "b", "", "normal")
     check("无链接时给提示而非空链接", "没有可用跳转链接" in no_url and "](" not in no_url)
-    long_content = channels.build_content("t", "字" * 3000, "u", "normal")
-    truncated = channels._truncate_utf8(long_content, channels.WECOM_MAX_BYTES)
-    check("超 4096 字节安全截断", len(truncated.encode("utf-8")) <= channels.WECOM_MAX_BYTES, str(len(truncated.encode("utf-8"))))
-    check("截断不留半个汉字（无替换符）", "\ufffd" not in truncated)
-    check("截断带提示尾串", truncated.endswith("（内容过长已截断）"), truncated[-30:])
-    mixed = channels._truncate_utf8(("中文abc" * 2000) + "尾", 100)
-    check("中英混排截断仍是合法 UTF-8", mixed.encode("utf-8").decode("utf-8") == mixed)
+    # === E1 回归：截断绝不能吃掉链接（审核实测 8519 字节正文截完链接整段消失）===
+    url = "https://code-rc.kimi.com/devices/dev-1/?rc=1&from=kimi_code_cli"
+    wecom_cap = channels.channel_limits("wecom_bot")["max_bytes"]
+    for size, label in ((2000, "2KB 正文"), (8519 // 3, "8.5KB 正文"), (50000 // 3, "50KB 正文")):
+        big = channels.build_content("⏳ Kimi 需要你：长正文", "字" * size, url, "normal", max_bytes=wecom_cap)
+        check(f"{label}：仍在 {wecom_cap} 字节预算内", len(big.encode("utf-8")) <= wecom_cap, str(len(big.encode("utf-8"))))
+        check(f"{label}：链接没被截掉", url in big and "[👉" in big, big[-80:])
+    huge = channels.build_content("标题", "啊" * 100000, url, "normal", max_bytes=300)
+    check("预算极小时也保住链接（宁可丢正文）", url in huge and len(huge.encode("utf-8")) <= 300, f"{len(huge.encode('utf-8'))} 字节")
+    check("正文过长时留截断提示", "…（内容过长已截断）" in channels.build_content("t", "字" * 4000, url, "normal", max_bytes=1000))
+    no_body = channels.build_content("标题", "", url, "normal", max_bytes=wecom_cap)
+    check("空正文只剩标题与链接时不出多余空行", "\n\n\n" not in no_body, repr(no_body[-60:]))
+
+    # === W12：出本机的内容先脱敏 ===
+    leaky = channels.build_content("标题", "密钥 sk-abcdefghijklmnop1234 和 token=abcdefghijklmnop1234567890 还有 webhook?key=SUPERSECRETKEY123", url, "normal")
+    check("sk- 密钥被打码", "sk-abcdefghijklmnop1234" not in leaky and "sk-***" in leaky, leaky)
+    check("key= 参数值被打码", "SUPERSECRETKEY123" not in leaky)
+    check("脱敏不伤跳转链接", url in leaky)
+    conn = channels.build_content("t", "postgres://user:suppersecret@10.0.0.9/db", url, "normal")
+    check("连接串口令被打码", "suppersecret" not in conn, conn)
+    check("redact_secrets 对空串安全", channels.redact_secrets("") == "")
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +223,12 @@ def test_linker(tmp: Path) -> None:
     links = linker.build_links(cfg)
     check("正常 rc.json → source=rc", links["source"] == "rc", str(links))
     check("正常 rc.json 取到 url", links["primary_url"] == good["url"])
-    check("正常 rc.json 带 fallback_url", links["fallback_url"] == "http://10.204.69.40:8791/")
+    check("正常 rc.json 带 fallback_url", links["fallback_url"] == "http://192.168.1.10:8791/")
 
     missing = make_cfg(tmp / "missing", rc_json_path=str(tmp / "nope" / "rc.json"))
     links = linker.build_links(missing)
     check("文件缺失 → source=fallback", links["source"] == "fallback", str(links))
-    check("文件缺失 → primary 落到 fallback", links["primary_url"] == "http://10.204.69.40:8791/")
+    check("文件缺失 → primary 落到 fallback", links["primary_url"] == "http://192.168.1.10:8791/")
 
     broken = make_cfg(tmp / "broken")
     Path(broken["rc_json_path"]).write_text("{不是合法 JSON", encoding="utf-8")
@@ -208,6 +243,17 @@ def test_linker(tmp: Path) -> None:
     Path(nourl["rc_json_path"]).write_text(json.dumps({"pid": 1}), encoding="utf-8")
     check("缺 url 字段 → fallback", linker.build_links(nourl)["source"] == "fallback")
 
+    # info 回归：合法但带前导空格的 url 不该被当成非法
+    padded = make_cfg(tmp / "padded")
+    Path(padded["rc_json_path"]).write_text(json.dumps({"pid": os.getpid(), "url": "  https://code-rc.kimi.com/devices/pad/  "}), encoding="utf-8")
+    links = linker.build_links(padded)
+    check("带前导空格的 url 仍走 rc", links["source"] == "rc", str(links))
+    check("空格被 strip 干净", links["primary_url"] == "https://code-rc.kimi.com/devices/pad/", links["primary_url"])
+    nonhttp = make_cfg(tmp / "nonhttp")
+    Path(nonhttp["rc_json_path"]).write_text(json.dumps({"url": "ftp://x"}), encoding="utf-8")
+    check("非 http(s) 协议 → fallback", linker.build_links(nonhttp)["source"] == "fallback")
+    check("cfg 传 None 不抛", linker.build_links(None)["source"] in ("rc", "fallback"))
+
     check("rc_is_alive 对活 pid 为真", linker.rc_is_alive(cfg) is True)
     dead = make_cfg(tmp / "dead")
     Path(dead["rc_json_path"]).write_text(json.dumps({"pid": 999999, "url": "https://x"}), encoding="utf-8")
@@ -220,6 +266,30 @@ def test_linker(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 # 4. policy
 # ---------------------------------------------------------------------------
+
+
+def seed_pushes(cfg: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    """直接铺 push_log.jsonl 历史：每行 `{kind, fp, age_s, ok, urgency}`。
+
+    自测要精确控制「多久前推过」，所以不靠真实时钟慢慢等；一次推送 = reserve + result 一对，
+    与 `policy.reserve_push/settle_push` 写出来的形状完全一致。
+    """
+    lines: list[str] = []
+    now = time.time()
+    for index, row in enumerate(rows):
+        rid = f"seed{index}"
+        ts = round(now - float(row.get("age_s", 0)), 3)
+        lines.append(json.dumps({
+            "ts": ts, "event": "reserve", "reserve_id": rid, "kind": row.get("kind", "Notification"),
+            "fingerprint": row.get("fp", f"fp{index}"), "urgency": row.get("urgency", "normal"),
+        }, ensure_ascii=False))
+        lines.append(json.dumps({
+            "ts": ts + 0.5, "event": "result", "reserve_id": rid, "ok": bool(row.get("ok", True)),
+            "channel": "mock", "status_code": 200 if row.get("ok", True) else 0,
+        }, ensure_ascii=False))
+    path = policy.push_log_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def test_policy(tmp: Path) -> None:
@@ -250,20 +320,24 @@ def test_policy(tmp: Path) -> None:
     ok, reason = policy.should_push({"hook_event_name": "Notification", "message": "任务完成"}, cfg)
     check("Notification → 推", ok is True, reason)
 
-    # --- 去重：同内容 60s 内第二次不推
+    # --- W5：去重窗口 10 分钟（方案要求），而且用户改得了
     cfg = make_cfg(tmp / "dedup")
     event = {"hook_event_name": "PermissionRequest", "message": "允许跑 build?"}
     fp = policy.fingerprint("", "允许跑 build?")
     check("第一次放行", policy.should_push(event, cfg)[0] is True)
-    policy.record_push(cfg, "PermissionRequest", fp, "mock", True)
-    check("60s 内同指纹去重", policy.should_push(event, cfg)[0] is False, "同内容应被去重")
-    aged = make_cfg(tmp / "dedup_aged")
-    policy.record_push(aged, "PermissionRequest", fp, "mock", True)
-    log_path = policy.push_log_path(aged)
-    lines = [json.loads(x) for x in log_path.read_text(encoding="utf-8").splitlines()]
-    lines[0]["ts"] = time.time() - 90
-    log_path.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
-    check("90s 后同指纹可再推", policy.should_push(event, aged)[0] is True)
+    seed_pushes(cfg, [{"kind": "PermissionRequest", "fp": fp, "age_s": 30}])
+    check("30s 内同指纹去重", policy.should_push(event, cfg)[0] is False)
+    seed_pushes(cfg, [{"kind": "PermissionRequest", "fp": fp, "age_s": 590}])
+    check("590s（10 分钟内）仍去重 —— 窗口不是 60s", policy.should_push(event, cfg)[0] is False, "dedup 窗口应为 600s")
+    seed_pushes(cfg, [{"kind": "PermissionRequest", "fp": fp, "age_s": 660}])
+    check("660s 后可再推", policy.should_push(event, cfg)[0] is True)
+    check("dedup_window_s 默认 600", policy.DEFAULTS["dedup_window_s"] == 600)
+    check("dedup_window_s 写进了配置模板", "dedup_window_s" in json.loads((HERE / "config.example.json").read_text(encoding="utf-8")))
+    check("dedup_window_s 在 DEFAULT_CONFIG 里", "dedup_window_s" in waitforme.DEFAULT_CONFIG)
+    seed_pushes(cfg, [{"kind": "PermissionRequest", "fp": fp, "age_s": 120}])
+    check("dedup_window_s 可配成 60s", policy.should_push(event, dict(cfg, dedup_window_s=60))[0] is True)
+    seed_pushes(cfg, [{"kind": "PermissionRequest", "fp": fp, "age_s": 30, "ok": False}])
+    check("失败的那条不占去重窗口（可以重试）", policy.should_push(event, cfg)[0] is True)
     check("fingerprint 稳定且 16 位", policy.fingerprint("a", "b") == policy.fingerprint("a", "b") and len(policy.fingerprint("a", "b")) == 16)
     check("fingerprint 区分内容", policy.fingerprint("a", "b") != policy.fingerprint("a", "c"))
 
@@ -285,24 +359,21 @@ def test_policy(tmp: Path) -> None:
     # --- 限流：连发 5 次只放 2 次（max_per_10min=2）
     cfg = make_cfg(tmp / "throttle", min_interval_s=0, max_per_10min=2, daily_limit=99)
     allowed = 0
-    for _ in range(5):
+    for i in range(5):
         if policy.throttle_ok("Notification", cfg):
             allowed += 1
-            policy.record_push(cfg, "Notification", policy.fingerprint("t", str(allowed)), "mock", True)
+            rid = policy.reserve_push(cfg, "Notification", policy.fingerprint("t", str(i)), "normal")
+            policy.settle_push(cfg, rid, True, channel="mock")
     check("连发 5 次只放 2 次", allowed == 2, f"allowed={allowed}")
 
     cfg = make_cfg(tmp / "interval", min_interval_s=180, max_per_10min=99, daily_limit=99)
     check("同类间隔未到 → 不放行", policy.throttle_ok("Notification", cfg) is True)
-    policy.record_push(cfg, "Notification", "fp1", "mock", True)
+    seed_pushes(cfg, [{"kind": "Notification", "fp": "fp1", "age_s": 10}])
     check("同类间隔已到 → 拦截", policy.throttle_ok("Notification", cfg) is False)
     check("换个类别仍可放行", policy.throttle_ok("Stop", cfg) is True)
     now = time.time()
     aged_cfg = make_cfg(tmp / "interval_aged", min_interval_s=30, max_per_10min=99, daily_limit=99)
-    policy.record_push(aged_cfg, "Notification", "fp", "mock", True)
-    p = policy.push_log_path(aged_cfg)
-    rec = json.loads(p.read_text(encoding="utf-8"))
-    rec["ts"] = round(now - 45, 3)
-    p.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+    seed_pushes(aged_cfg, [{"kind": "Notification", "fp": "fp", "age_s": 45}])
     check("间隔过完后放行", policy.throttle_ok("Notification", aged_cfg, now) is True)
 
     cfg = make_cfg(tmp / "daily", min_interval_s=0, max_per_10min=99, daily_limit=3)
@@ -310,8 +381,77 @@ def test_policy(tmp: Path) -> None:
     for i in range(6):
         if policy.throttle_ok("Notification", cfg):
             day_allowed += 1
-            policy.record_push(cfg, "Notification", f"fp-{i}", "mock", True)
+            rid = policy.reserve_push(cfg, "Notification", f"fp-{i}", "normal")
+            policy.settle_push(cfg, rid, True, channel="mock")
     check("当日上限生效（3 次）", day_allowed == 3, f"allowed={day_allowed}")
+
+    # === E3 回归：失败不吃额度，但记录留着可观测 ===
+    cfg = make_cfg(tmp / "e3", min_interval_s=0, max_per_10min=99, daily_limit=3)
+    seed_pushes(cfg, [{"kind": "Notification", "fp": f"x{i}", "ok": False} for i in range(3)])
+    check("3 条失败不吃当日上限", policy.throttle_ok("Notification", cfg) is True, "断网一次就白扣配额是不可接受的")
+    check("失败记录仍在日志里可查", len(policy.read_push_log(cfg)) == 6, str(len(policy.read_push_log(cfg))))
+    check("count_today 只算成功", policy.count_today(cfg) == 0)
+    check("count_today(only_ok=False) 算占用中的额度", policy.count_today(cfg, only_ok=False) == 0)
+    seed_pushes(cfg, [{"kind": "Notification", "fp": f"x{i}", "ok": True} for i in range(3)])
+    check("成功 3 条后才触顶", policy.throttle_ok("Notification", cfg) is False)
+    cfg = make_cfg(tmp / "e3b", min_interval_s=180, max_per_10min=99, daily_limit=99)
+    seed_pushes(cfg, [{"kind": "Notification", "fp": "f1", "ok": False, "age_s": 5}])
+    check("失败的同类不占最小间隔", policy.throttle_ok("Notification", cfg) is True)
+    cfg = make_cfg(tmp / "e3c", min_interval_s=180, max_per_10min=99, daily_limit=99)
+    seed_pushes(cfg, [{"kind": "Notification", "fp": "f1", "ok": True, "age_s": 5}])
+    check("成功的同类仍占最小间隔", policy.throttle_ok("Notification", cfg) is False)
+
+    # === W6 回归：额度是预占的，同刻并发不会一起放行 ===
+    cfg = make_cfg(tmp / "w6", min_interval_s=180, max_per_10min=2, daily_limit=99)
+    d1 = policy.gate({"hook_event_name": "Notification", "message": "并发一"}, cfg, kind="Notification", now=time.time())
+    d2 = policy.gate({"hook_event_name": "Notification", "message": "并发二"}, cfg, kind="Notification", now=time.time())
+    check("gate 返回 reserve_id", bool(d1.get("reserve_id")), str(d1))
+    check("同刻第二条被预占的同类间隔挡下", d1["allowed"] is True and d2["allowed"] is False, f"{d1} / {d2}")
+    policy.settle_push(cfg, d1["reserve_id"], False, channel="mock", error="network_error:Timeout@x")
+    d3 = policy.gate({"hook_event_name": "Notification", "message": "并发二"}, cfg, kind="Notification", now=time.time() + 1)
+    check("失败退还后同内容可重试", d3["allowed"] is True, str(d3))
+    # 还没发完的 pending 也要算进额度，否则空窗期照样放行
+    cfg = make_cfg(tmp / "w6b", min_interval_s=0, max_per_10min=2, daily_limit=99)
+    p1 = policy.reserve_push(cfg, "Notification", "fp-p1", "normal")
+    check("1 条 pending 就占额度（还差 1 到顶）", policy.throttle_ok("Notification", cfg) is True)
+    p2 = policy.reserve_push(cfg, "Notification", "fp-p2", "normal")
+    check("2 条 pending 顶满突发上限", policy.throttle_ok("Notification", cfg) is False, "预占没回填也该算，不然空窗期会一起放行")
+    policy.settle_push(cfg, p2, False, channel="mock", error="network_error:Timeout@x")
+    check("pending 失败回填后额度退回", policy.throttle_ok("Notification", cfg) is True)
+    policy.settle_push(cfg, p1, True, channel="mock", status_code=200)
+    p3 = policy.reserve_push(cfg, "Notification", "fp-p3", "normal")
+    policy.settle_push(cfg, p3, True, channel="mock", status_code=200)
+    check("成功的那两条额度不退还", policy.throttle_ok("Notification", cfg) is False)
+    cfg = make_cfg(tmp / "w6c", min_interval_s=0, max_per_10min=99, daily_limit=99)
+    rid = policy.reserve_push(cfg, "Notification", "fp-x", "normal")
+    policy.cancel_reserve(cfg, rid, "queue_full")
+    check("显式 cancel 也退还额度", len(policy.counted_pushes(cfg)) == 0)
+    check("gate(reserve=False) 只判不占", policy.gate({"hook_event_name": "Notification", "message": "诊断"},
+          make_cfg(tmp / "w6d"), kind="Notification", reserve=False).get("reserve_id") is None)
+
+    # === W8 回归：high 只越静默时段，不再无限推 ===
+    cfg = make_cfg(tmp / "w8", min_interval_s=180, max_per_10min=2, daily_limit=99,
+                   quiet_hours={"start": "23:00", "end": "08:30"})
+    night = local_ts(23, 30)
+    high = {"hook_event_name": "Notification", "message": "紧急一", "urgency": "high"}
+    check("high 越静默时段", policy.gate(high, cfg, kind="Notification", now=night)["allowed"] is True)
+    # 注意用真实 now：预占记录写的是墙上时钟，拿未来的假 now 去比会把它们全当成「很久以前」。
+    # 也另起一份 cfg：上面那次「high 越静默时段」已经占掉一格额度，混在一起数会算错口径。
+    cfg_high = make_cfg(tmp / "w8burst", min_interval_s=180, max_per_10min=2, daily_limit=99,
+                        quiet_hours={"start": "23:00", "end": "08:30"})
+    burst_high = 0
+    for i in range(8):
+        d = policy.gate(dict(high, message=f"紧急{i}"), cfg_high, kind="Notification")
+        if d["allowed"]:
+            burst_high += 1
+            policy.settle_push(cfg_high, d["reserve_id"], True, channel="mock")
+    check("high 也受 10 分钟硬上限（≤5）", burst_high == 5, f"放行了 {burst_high} 条")
+    check("high 的硬上限与配置里的 2 无关", burst_high > 2, str(burst_high))
+    cfg2 = make_cfg(tmp / "w8b", min_interval_s=0, max_per_10min=99, daily_limit=2,
+                    quiet_hours={"start": "00:00", "end": "00:00"})
+    seed_pushes(cfg2, [{"kind": "Notification", "fp": f"a{i}", "urgency": "high"} for i in range(50)])
+    check("high 有当日硬上限（≤50）", policy.throttle_ok("Notification", cfg2, urgency="high") is False)
+    check("high 不越事件类型策略", policy.gate({"hook_event_name": "SubagentStop", "urgency": "high"}, cfg, now=night)["allowed"] is False)
 
     # --- gate：静默时段拦普通、high 越限、不放过非法事件
     cfg = make_cfg(tmp / "gate", quiet_hours={"start": "23:00", "end": "08:30"}, min_interval_s=0, max_per_10min=99, daily_limit=99)
@@ -368,8 +508,9 @@ def test_concurrent_append(tmp: Path) -> None:
             bad += 1
     check(f"{total} 线程并发写不丢行不写串", len(lines) == total and bad == 0, f"只 {len(lines)} 行，坏 {bad}")
     check("内容完整（i 全齐）", sorted(p.get("i", -1) for p in parsed) == list(range(total)), f"缺 {sorted(set(range(total)) - {p.get('i', -1) for p in parsed})[:6]}")
-    push_lines = [l for l in policy.push_log_path(cfg).read_text(encoding="utf-8").splitlines() if l.strip()]
-    check("push_log 并发也不丢计数", len(push_lines) == total, f"{len(push_lines)}/{total}")
+    pushes = policy.counted_pushes(cfg)
+    check("push_log 并发也不丢计数", len(pushes) == total, f"{len(pushes)}/{total}")
+    check("并发写的 reserve/result 都能配对", len(policy.read_push_log(cfg)) == total * 2, str(len(policy.read_push_log(cfg))))
 
 
 class _FakeResponse:
@@ -394,9 +535,16 @@ class _FakeRequests:
         self.calls: list[dict] = []
 
     def post(self, url, **kwargs):
-        self.calls.append({"url": url, **kwargs})
+        self.calls.append({"url": url, "params": kwargs.get("params"), "json": kwargs.get("json"),
+                          "data": kwargs.get("data"), "timeout": kwargs.get("timeout")})
         if self.mode == "timeout":
             raise self.Timeout("simulated timeout")
+        if self.mode == "leak":
+            # requests 的真实异常串里会带上完整 URL（含 ?key=...），拿来验脱敏
+            raise self.RequestException(
+                "HTTPSConnectionPool(host='qyapi.weixin.qq.com', port=443): Max retries exceeded with url: "
+                "/cgi-bin/webhook/send?key=SUPERSECRETKEY0123456789abcdef (Caused by NewConnectionError)"
+            )
         if self.mode == "remote_fail":
             return _FakeResponse(401, {"code": -1000, "message": "simulated bad key"})
         return _FakeResponse(200, {"errcode": 0, "errmsg": "ok"})
@@ -445,6 +593,41 @@ def test_channels(tmp: Path) -> None:
     _stub_net("ok")
     result = channels.send(make_cfg(tmp / "netok", channel="wecom_bot", channels={"wecom_bot": {"key": "test-key"}}), "t", "b", "u")
     check("远端 errcode=0 → ok:true", result["ok"] is True and result["status_code"] == 200, str(result))
+    _restore_net()
+
+    # === E4 回归：异常串不许把 webhook key / SCKEY 带出去 ===
+    leaky_cfg = make_cfg(tmp / "leak", channel="wecom_bot", channels={"wecom_bot": {"key": "SUPERSECRETKEY0123456789abcdef"}})
+    _stub_net("leak")
+    result = channels.send(leaky_cfg, "t", "b", "http://u")
+    check("异常也折成 ok:false", result["ok"] is False and result["error"].startswith("network_error"), str(result))
+    check("error 里不含明文 key", "SUPERSECRETKEY0123456789abcdef" not in json.dumps(result), str(result["error"]))
+    check("error 里保留了主机名便于排障", "qyapi.weixin.qq.com" in result["error"], str(result["error"]))
+    rid = policy.reserve_push(leaky_cfg, "manual", "fp-leak", "normal")
+    policy.settle_push(leaky_cfg, rid, False, channel="wecom_bot", error=result["error"])
+    disk = policy.push_log_path(leaky_cfg).read_text(encoding="utf-8")
+    check("写进 push_log 的 error 同样是脱敏过的", "SUPERSECRETKEY0123456789abcdef" not in disk, disk[:200])
+    _stub_net("timeout")
+    result = channels.send(make_cfg(tmp / "tmo", channel="serverchan", channels={"serverchan": {"sckey": "SCT0123456789abcdefghij"}}), "t", "b", "u")
+    check("ServerChan 异常不泄露 SCKEY", "SCT0123456789abcdefghij" not in json.dumps(result), str(result["error"]))
+    _restore_net()
+
+    # === W13 回归：分通道标题上限；所有网络调用 timeout=10 ===
+    _stub_net("ok")
+    long_title = "⏳ 要你拍板：billing 历史数据到底要不要动，这一句已经很长了" + "尾巴" * 6
+    sc_cfg = make_cfg(tmp / "title_sc", channel="serverchan", channels={"serverchan": {"sckey": "test-sckey"}})
+    channels.send(sc_cfg, long_title, "b", "http://u")
+    sent_title = channels.requests.calls[-1]["data"]["title"]  # type: ignore[attr-defined]
+    check("serverchan 标题被压到 32 字内", len(sent_title) <= 32, f"{len(sent_title)} 字：{sent_title}")
+    check("serverchan 标题截断带省略号", sent_title.endswith("…"), sent_title)
+    pp_cfg = make_cfg(tmp / "title_pp", channel="pushplus", channels={"pushplus": {"token": "test-token"}})
+    channels.send(pp_cfg, long_title, "b", "http://u")
+    check("pushplus 标题上限 100 字", len(channels.requests.calls[-1]["json"]["title"]) <= 100, str(len(long_title)))  # type: ignore[attr-defined]
+    wc_cfg = make_cfg(tmp / "title_wc", channel="wecom_bot", channels={"wecom_bot": {"key": "test-key"}})
+    channels.send(wc_cfg, long_title, "b", "http://u")
+    content_sent = channels.requests.calls[-1]["json"]["markdown"]["content"]  # type: ignore[attr-defined]
+    check("企微标题按 40 字上限收敛", len(content_sent.splitlines()[0]) <= 44, content_sent.splitlines()[0])
+    check("所有通道调用 timeout=10", all(c["timeout"] == channels.NET_TIMEOUT_S for c in channels.requests.calls), str([c["timeout"] for c in channels.requests.calls]))  # type: ignore[attr-defined]
+    check("企微 key 走 params 不进 URL 字符串", "key" not in channels.requests.calls[-1]["url"], channels.requests.calls[-1]["url"])  # type: ignore[attr-defined]
     _restore_net()
     check("resolve_channel 覆盖优先", channels.resolve_channel({"channel": "wecom_bot"}, "mock") == "mock")
     check("resolve_channel 没配当 mock", channels.resolve_channel({"channel": ""}, None) == "mock")
@@ -535,12 +718,32 @@ def test_hooks(tmp: Path) -> None:
         check("/health 返回 ok:true + push_today", health.json().get("ok") is True and "push_today" in health.json(), health.text)
 
         base = f"http://127.0.0.1:{port}/hook"
-        wrong = requests.post(base, params={"k": "wrong-token"}, json={"hook_event_name": "Notification"}, timeout=5)
+        # === W7 回归：同一个 keep-alive 连接上，403/404 之后不能再出现 400 ===
+        # 老代码在错误分支没把请求体读干净，残留字节被当成下一个请求的开头，
+        # 实测同一个 Session 里「错 token POST → 正确 POST」第二条直接收到 400
+        sess = requests.Session()
+        wrong = sess.post(base, params={"k": "wrong-token"}, json={"hook_event_name": "Notification", "message": "错 token"}, timeout=5)
         check("token 不匹配 → 403", wrong.status_code == 403, wrong.text)
-        missing = requests.post(base, json={"hook_event_name": "Notification"}, timeout=5)
-        check("不带 token → 403", missing.status_code == 403, missing.text)
-        check("403 时不推送", not mock_path.exists())
+        wait_mock_count(cfg, 0, timeout_s=1.5)
+        check("403 不产生推送", len(read_mock(cfg)) == 0, str(len(read_mock(cfg))))
+        after_wrong = sess.post(base, params={"k": "test-token"}, json={"hook_event_name": "Notification", "session_id": "abcd1234ef56",
+                                                "cwd": "D:/anyi/billing", "message": "错 token 之后的正常请求"}, timeout=5)
+        check("403 之后同一连接仍正常应答（不 400）", after_wrong.status_code == 200, after_wrong.text[:200])
+        sess.close()
 
+        sess2 = requests.Session()
+        check("未知路径 GET → 404", sess2.get(f"http://127.0.0.1:{port}/nope", timeout=5).status_code == 404)
+        after_404 = sess2.get(f"http://127.0.0.1:{port}/health", timeout=5)
+        check("404 之后同一连接 /health 仍 200（不 400）", after_404.status_code == 200 and after_404.json().get("ok") is True, after_404.text[:200])
+        sess2.close()
+
+        check("不带 token → 403", requests.post(base, json={"hook_event_name": "Notification"}, timeout=5).status_code == 403)
+        check("只差一个字符的 token → 403", requests.post(base, params={"k": "test-toke"}, json={"message": "差一个字符"}, timeout=5).status_code == 403)
+
+        # W7 那一批请求已经推过事件了，之后的计数一律以当前条数为基线
+        wait_mock_count(cfg, 1, timeout_s=10)
+        baseline = len(read_mock(cfg))
+        check("W7 的正常请求确实推到了", baseline >= 1, str(baseline))
         expected = 0
         for evt, body, should_push, label in HOOK_EVENTS:
             resp = requests.post(base, params={"k": "test-token", "evt": evt}, json=body, timeout=5)
@@ -552,9 +755,9 @@ def test_hooks(tmp: Path) -> None:
                 expected += 1
 
         # 异步推送：等到条数齐了再断言（超时则按实际条数报错）
-        wait_mock_count(cfg, expected)
+        wait_mock_count(cfg, baseline + expected)
         got = len(read_mock(cfg))
-        check(f"mock 收到 {expected} 条（等于期望推送数）", got == expected, f"got={got} expected={expected}")
+        check(f"新增 mock 条数 = 期望推送数 {expected}", got == baseline + expected, f"got={got} baseline={baseline} expected={expected}")
         records = read_mock(cfg)
         check("推送标题是「Kimi 需要你」", all("Kimi 需要你" in r["title"] for r in records), str(records[:1]))
         check("推送标题带事件中文名", all(("等你授权" in r["title"]) or ("有新通知" in r["title"]) or ("回合结束" in r["title"]) for r in records), str([r["title"] for r in records]))
@@ -599,7 +802,7 @@ def test_hooks(tmp: Path) -> None:
         long_message = "开头标记" + "甲" * 800
         post_evt("长消息事件", expect_push=True,
                  json={"hook_event_name": "Notification", "session_id": "abcd1234ef56", "cwd": "D:/anyi/billing", "message": long_message})
-        wait_mock_count(cfg, expected)
+        wait_mock_count(cfg, baseline + expected)
         long_records = [r for r in read_mock(cfg) if "开头标记" in r["content"]]
         check("长消息被截断（原文不全进来）", bool(long_records) and "甲" * 800 not in long_records[-1]["content"], str(len(long_records)))
         check("截断带省略号", bool(long_records) and "…" in long_records[-1]["content"])
@@ -608,7 +811,7 @@ def test_hooks(tmp: Path) -> None:
         gbk_body = json.dumps({"hook_event_name": "Notification", "session_id": "abcd1234ef56",
                                "cwd": "D:/anyi/billing", "message": "需要授权删除旧订单"}, ensure_ascii=False).encode("gb18030")
         post_evt("GBK 编码 body", expect_push=True, data=gbk_body, headers={"Content-Type": "application/json"})
-        wait_mock_count(cfg, expected)
+        wait_mock_count(cfg, baseline + expected)
         gbk_records = [r for r in read_mock(cfg) if "删除旧订单" in r["content"]]
         check("GBK body 也被正确解码", bool(gbk_records), "应能读到中文而不是乱码")
         check("推送里没有替换符", all("\ufffd" not in r["content"] for r in read_mock(cfg)), str([r["content"][:60] for r in read_mock(cfg) if "\ufffd" in r["content"]][:1]))
@@ -622,18 +825,28 @@ def test_hooks(tmp: Path) -> None:
         check("未知路径 → 404", resp.status_code == 404)
 
         # 原始事件必须全部落盘，这是以后校准字段映射的唯一依据
-        wait_mock_count(cfg, expected)
+        wait_mock_count(cfg, baseline + expected)
         raw_lines = read_raw(cfg)
-        check("原始事件已落盘 events.raw.jsonl", len(raw_lines) >= 13, str(len(raw_lines)))
+        # 403/404 不进 handle_hook；本段合法 /hook 200 = after_wrong1 + HOOK_EVENTS5 + post_evt7 + 非JSON1 + 空body1 = 15
+        check("原始事件全落盘（含被拦下的）", len(raw_lines) >= len(read_mock(cfg)) and len(raw_lines) >= 15, f"raw={len(raw_lines)} mock={len(read_mock(cfg))}")
         if raw_lines:
             check("落盘含 ts 与 raw 字段", "ts" in raw_lines[0] and "raw" in raw_lines[0], str(raw_lines[0])[:150])
         check("hooks.log 已生成", (Path(cfg["log_dir"]) / "hooks.log").exists())
+        # === E2 回归：hook_token 不许进日志（真实日志里曾经明文躺着完整 token）===
+        log_text = (Path(cfg["log_dir"]) / "hooks.log").read_text(encoding="utf-8", errors="replace")
+        check("hooks.log 里没有明文 token", "test-token" not in log_text, [l for l in log_text.splitlines() if "test-token" in l][:1])
+        check("hooks.log 里能看到打码后的痕迹", "?k=***" in log_text, [l for l in log_text.splitlines() if "/hook" in l][:1])
+        child_out = (Path(cfg["log_dir"]) / "hooks.child.out.log").read_text(encoding="utf-8", errors="replace")
+        check("子进程 stdout/stderr 也没有 token", "test-token" not in child_out, child_out[:200])
+        check("redact_token 单元行为", hooks_redact("POST /hook?k=SECRET&evt=Stop HTTP/1.1") == "POST /hook?k=***&evt=Stop HTTP/1.1")
+        check("redact_token 不动无 token 的 URL", hooks_redact("GET /health HTTP/1.1") == "GET /health HTTP/1.1")
+        check("raw 事件落盘不写 query 里的 k", not any("test-token" in r.get("raw", "") + json.dumps(r.get("query", {})) for r in read_raw(cfg)))
 
         # 去重：必须等第一次的推送真的落 push_log，再发第二条，否则测的是竞态不是去重
         dup = {"hook_event_name": "PermissionRequest", "session_id": "abcd1234ef56", "cwd": "D:/anyi/billing", "message": "重复内容测试"}
         first = requests.post(base, params={"k": "test-token"}, json=dup, timeout=5).json()
         for _ in range(40):
-            if len(read_mock(cfg)) > expected:
+            if len(read_mock(cfg)) > baseline + expected:
                 break
             time.sleep(0.2)
         second = requests.post(base, params={"k": "test-token"}, json=dup, timeout=5).json()
@@ -680,6 +893,30 @@ def test_hooks(tmp: Path) -> None:
 # ---------------------------------------------------------------------------
 # 7. CLI（stdout 必须是合法的一行 JSON）
 # ---------------------------------------------------------------------------
+
+
+def ask_with_late_answer(cfg: dict[str, Any], env: dict[str, str], payload_file: Path,
+                         answer: dict[str, Any], deadline: int = 25, delay: float = 1.5) -> tuple[int, str, Path]:
+    """跑 `ask --wait`，起跑 `delay` 秒后把答案写进 inbox。
+
+    顺序很重要：真实场景是推送先出去、手机上后回话。先写答案再跑会被 W9 的
+    「推送前清同名旧答案」逻辑删掉，那样测的是清理而不是等待。
+    """
+    path = waitforme.answer_path(answer["id"], cfg)
+    proc = subprocess.Popen(
+        [sys.executable, str(HERE / "waitforme.py"), "ask", "--payload", str(payload_file),
+         "--wait", "--deadline-s", str(deadline)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=str(HERE),
+        text=True, encoding="utf-8", errors="replace")
+    time.sleep(delay)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(answer, ensure_ascii=False), encoding="utf-8")
+    try:
+        stdout, _ = proc.communicate(timeout=deadline + 30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, _ = proc.communicate()
+    return int(proc.returncode), (stdout or "").strip(), path
 
 
 def run_cli(tmp: Path, args: list[str]) -> tuple[int, str, str]:
@@ -738,7 +975,7 @@ def test_cli(tmp: Path) -> None:
     code, out, err = run_cli(tmp, ["ask", "--payload", str(ghost)])
     check("payload 文件不存在 → invalid 退出 2 不崩", code == 2 and json.loads(out)["status"] == "invalid", f"code={code} {out[:200]}")
 
-    # --wait：先放好答案文件，应该立刻读到
+    # --wait：真实顺序是「先推送、手机后回话」。答案在进程起跑后才写进 inbox。
     wait_cfg_dir = tmp / "ask_wait"
     wait_cfg_dir.mkdir(parents=True, exist_ok=True)
     answered_payload = dict(VALID_PAYLOAD, id="ask-wait-ok")
@@ -747,25 +984,49 @@ def test_cli(tmp: Path) -> None:
     cfg = make_cfg(wait_cfg_dir)
     config_path = write_tmp_config(wait_cfg_dir, cfg)
     env = dict(os.environ, WAITFORME_CONFIG=str(config_path), PYTHONIOENCODING="utf-8")
-    answer = Path(cfg["inbox_dir"]) / "ask-wait-ok.answer.json"
-    answer.parent.mkdir(parents=True, exist_ok=True)
-    answer.write_text(json.dumps({"choice": "B", "note": "先上线，历史数据我不管"}, ensure_ascii=False), encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(HERE / "waitforme.py"), "ask", "--payload", str(p_file), "--wait", "--deadline-s", "20"],
-                          capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, cwd=str(HERE), timeout=90)
-    out = json.loads(proc.stdout.strip())
-    check("ask --wait 读到答案 → answered 退出 0", proc.returncode == 0 and out["status"] == "answered", f"code={proc.returncode} {proc.stdout[:200]}")
-    check("answered 带回 choice/note/answer_file", out.get("choice") == "B" and "先上线" in out.get("note", "") and out.get("answer_file"), str(out))
+
+    code, stdout, path = ask_with_late_answer(cfg, env, p_file, {"id": "ask-wait-ok", "choice": "B", "note": "先上线，历史数据我不管"}, deadline=25)
+    out = json.loads(stdout) if stdout else {}
+    check("ask --wait 读到答案 → answered 退出 0", code == 0 and out.get("status") == "answered", f"code={code} {stdout[:200]}")
+    check("answered 带回 choice/note/answer_file", out.get("choice") == "B" and "先上线" in out.get("note", "") and out.get("answer_file") == str(path), str(out))
+    check("answered 标出来源是回答", out.get("choice_source") == "reply", str(out))
 
     # 回了不在 options 里的字母：按默认项走，但把原值交出去
     bad_payload = dict(VALID_PAYLOAD, id="ask-wait-bad-choice")
     b_file = wait_cfg_dir / "b.json"
     b_file.write_text(json.dumps(bad_payload, ensure_ascii=False), encoding="utf-8")
-    (Path(cfg["inbox_dir"]) / "ask-wait-bad-choice.answer.json").write_text(
-        json.dumps({"choice": "Z", "note": "手滑"}, ensure_ascii=False), encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(HERE / "waitforme.py"), "ask", "--payload", str(b_file), "--wait", "--deadline-s", "20"],
+    code, stdout, _ = ask_with_late_answer(cfg, env, b_file, {"id": "ask-wait-bad-choice", "choice": "Z", "note": "手滑"}, deadline=25)
+    out = json.loads(stdout) if stdout else {}
+    check("回答非法字母 → answered 回落默认项 退出 0", code == 0 and out.get("choice") == "A" and out.get("raw_choice") == "Z", f"code={code} {stdout[:200]}")
+    check("非法回答的回落有标记", out.get("choice_source") == "invalid_reply_fallback", str(out))
+
+    # === W9 回归：旧答案不许串到下一次请求 ===
+    p_a = waitforme.answer_path("中文id甲", cfg)
+    p_b = waitforme.answer_path("中文id乙", cfg)
+    check("纯非 ASCII 的 id 不再撞同一个答案文件", p_a != p_b, f"{p_a.name} vs {p_b.name}")
+    ascii_path = waitforme.answer_path("ask-20261031-01", cfg)
+    check("ASCII id 保留可读前缀 + 哈希后缀", ascii_path.name.startswith("ask-20261031-01-") and ascii_path.name.endswith(".answer.json"), ascii_path.name)
+    stale = wait_cfg_dir / "st.json"
+    stale_payload = dict(VALID_PAYLOAD, id="ask-wait-stale")
+    stale.write_text(json.dumps(stale_payload, ensure_ascii=False), encoding="utf-8")
+    stale_path = waitforme.answer_path("ask-wait-stale", cfg)
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text(json.dumps({"id": "上一次的历史请求", "choice": "A", "note": "旧答案"}, ensure_ascii=False), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(HERE / "waitforme.py"), "ask", "--payload", str(stale), "--wait", "--deadline-s", "3"],
                           capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, cwd=str(HERE), timeout=90)
     out = json.loads(proc.stdout.strip())
-    check("回答非法字母 → answered 回落默认项 退出 0", proc.returncode == 0 and out["choice"] == "A" and out.get("raw_choice") == "Z", f"code={proc.returncode} {proc.stdout[:200]}")
+    check("预置的旧答案不会立刻被当成回答（应 timeout）", proc.returncode == 2 and out["status"] == "timeout", f"code={proc.returncode} {proc.stdout[:200]}")
+    check("ask 前同名旧答案文件已被清掉", not stale_path.exists() or json.loads(stale_path.read_text(encoding="utf-8")).get("id") != "上一次的历史请求", str(stale_path))
+    # read_answer 单独验：id 必须对得上
+    any_path = wait_cfg_dir / "any.answer.json"
+    any_path.write_text(json.dumps({"id": "req-x", "choice": "B"}, ensure_ascii=False), encoding="utf-8")
+    check("不带 id 也能读（兼容手工写的文件）", waitforme.read_answer(any_path) is not None)
+    check("id 不匹配 → 忽略", waitforme.read_answer(any_path, "req-y") is None)
+    check("id 匹配 → 认", (waitforme.read_answer(any_path, "req-x") or {}).get("choice") == "B")
+    any_path.write_text(json.dumps({"choice": "B"}, ensure_ascii=False), encoding="utf-8")
+    check("答案里没有 id → 忽略", waitforme.read_answer(any_path, "req-x") is None)
+    any_path.write_text("半截 {", encoding="utf-8")
+    check("半截 JSON 不算回答", waitforme.read_answer(any_path, "req-x") is None)
 
     timeout_payload = dict(VALID_PAYLOAD, id="ask-wait-timeout")
     t_file = wait_cfg_dir / "t.json"
@@ -784,6 +1045,87 @@ def test_cli(tmp: Path) -> None:
     check("test --mock 退出 0 且 stdout 单行 JSON", code == 0 and out.count("\n") == 0, f"code={code}")
     check("test 的 stderr 里有完整 markdown", "### ⏳ Kimi 需要你：测试通道" in err, err[-300:])
     check("test 报告 link_source", json.loads(out).get("link_source") in ("rc", "fallback"), out[:200])
+
+    # === W11 回归：用法错误也得守「stdout 一行 JSON」，且用退出码 3 与业务失败区分 ===
+    usage_cases = [
+        ("无参数裸跑", []),
+        ("缺 --title", ["send", "--urgency", "normal"]),
+        ("urgency 值非法", ["send", "--title", "x", "--urgency", "asap"]),
+        ("channel 值非法", ["send", "--title", "x", "--channel", "telegram"]),
+        ("未知子命令", ["nope"]),
+    ]
+    for label, argv in usage_cases:
+        code, out, err = run_cli(tmp, argv)
+        ok_json = False
+        status = None
+        if out and out.count("\n") == 0:
+            try:
+                data = json.loads(out)
+                ok_json = isinstance(data, dict)
+                status = data.get("status")
+                reason = data.get("reason", "")
+            except (json.JSONDecodeError, ValueError):
+                reason = out[:80]
+        else:
+            reason = f"stdout={out!r}"
+        check(f"用法错误 {label} → usage_error JSON", ok_json and status == "usage_error", reason)
+        check(f"用法错误 {label} → 退出码 3", code == 3, f"code={code}")
+    code, out, err = run_cli(tmp, ["--help"])
+    check("--help 仍走 argparse 正常退出 0", code == 0, f"code={code}")
+
+    # === W10 回归：显式 ask/send 也要过静默时段，除非 --force 或 high ===
+    quiet_cfg = make_cfg(tmp / "quiet_cli")
+    now = datetime.now()
+    quiet_cfg["quiet_hours"] = {
+        "start": (now - timedelta(hours=1)).strftime("%H:%M"),
+        "end": (now + timedelta(hours=1)).strftime("%H:%M"),
+    }
+    qdir = tmp / "quiet_cli"
+    qdir.mkdir(parents=True, exist_ok=True)
+    config_path = write_tmp_config(qdir, quiet_cfg)
+    qenv = dict(os.environ, WAITFORME_CONFIG=str(config_path), PYTHONIOENCODING="utf-8")
+    qfile = qdir / "q.json"
+    qfile.write_text(json.dumps(VALID_PAYLOAD, ensure_ascii=False), encoding="utf-8")
+    mock_path = Path(quiet_cfg["log_dir"]) / "mock_sent.jsonl"
+
+    def qrun(args: list[str]) -> tuple[int, dict]:
+        proc = subprocess.run([sys.executable, str(HERE / "waitforme.py"), *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=qenv, cwd=str(HERE), timeout=90)
+        return proc.returncode, (json.loads(proc.stdout.strip()) if proc.stdout.strip() else {})
+
+    check("测试用的静默窗口确实覆盖现在", policy.in_quiet_hours(quiet_cfg) is True, str(quiet_cfg["quiet_hours"]))
+    code, data = qrun(["ask", "--payload", str(qfile)])
+    check("静默时段 ask 被拦 → blocked 退出 2", code == 2 and data.get("status") == "blocked" and "quiet_hours" in data.get("reason", ""), str(data))
+    check("被拦下时没有推送落盘", not mock_path.exists() or len(read_jsonl(mock_path)) == 0, str(read_jsonl(mock_path)))
+    code, data = qrun(["ask", "--payload", str(qfile), "--force"])
+    check("--force 可越静默时段 → sent 退出 0", code == 0 and data.get("status") == "sent", str(data))
+    code, data = qrun(["send", "--title", "静默时段", "--channel", "mock"])
+    check("静默时段 send 被拦", code == 2 and data.get("status") == "blocked", str(data))
+    code, data = qrun(["send", "--title", "紧急", "--urgency", "high", "--channel", "mock"])
+    check("send --urgency high 越静默时段", code == 0 and data.get("status") == "sent", str(data))
+    high_payload = dict(VALID_PAYLOAD, id="ask-high-quiet", urgency="high")
+    hfile = qdir / "high.json"
+    hfile.write_text(json.dumps(high_payload, ensure_ascii=False), encoding="utf-8")
+    code, data = qrun(["ask", "--payload", str(hfile)])
+    check("ask payload 里 urgency=high 越静默时段", code == 0 and data.get("status") == "sent", str(data))
+    code, data = qrun(["test", "--live", "--mock"])
+    check("test --live 也受静默时段约束", code == 2 and data.get("status") == "blocked", str(data))
+    check("--dry-run 不受静默时段影响（本来就不发）", qrun(["ask", "--payload", str(qfile), "--dry-run"])[0] == 0)
+
+    # === info 回归：enabled 写成字符串 "false" 也算关 ===
+    off_cfg = make_cfg(tmp / "off")
+    off_cfg["enabled"] = "false"
+    off_dir = tmp / "off"
+    off_dir.mkdir(parents=True, exist_ok=True)
+    off_env = dict(os.environ, WAITFORME_CONFIG=str(write_tmp_config(off_dir, off_cfg)), PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([sys.executable, str(HERE / "waitforme.py"), "send", "--title", "x", "--channel", "mock"],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", env=off_env, cwd=str(HERE), timeout=60)
+    data = json.loads(proc.stdout.strip())
+    check('enabled="false" 不推送', data.get("status") == "failed" and data.get("error") == "disabled", str(data))
+    proc = subprocess.run([sys.executable, str(HERE / "waitforme.py"), "status"],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", env=off_env, cwd=str(HERE), timeout=60)
+    check('status 里 enabled 反映为 false', json.loads(proc.stdout.strip())["enabled"] is False, proc.stdout[:200])
+    check("truthy 解析多种写法", [waitforme.truthy(v) for v in ("false", "0", "no", "off", "", True, "TRUE", "yes")] == [False, False, False, False, False, True, True, True])
 
 
 # ---------------------------------------------------------------------------

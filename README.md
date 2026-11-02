@@ -134,7 +134,7 @@ selftest.py        160 项离线断言 + 可选 --live
   `logs/events.raw.jsonl`，跑几天后按真实字段收紧映射。
 - **跳转链接能不能真的连上要你在手机上实测**。`linker` 读的是 `rc.json` 里当时那次会话的
   URL；远程控制进程可能已退出（`rc_is_alive()` 只提示，不阻断），URL 也可能过期。
-  读不到 `rc.json` 时退到 `fallback_url`（局域网答题页 `http://10.204.69.40:8791/`），
+  读不到 `rc.json` 时退到 `fallback_url`（局域网答题页 `http://192.168.1.10:8791/`），
   那个页面得自己保证在跑。
 - 答案回传只有 `inbox/*.answer.json` 这一条路：谁写这个文件不在本项目范围内。
 - Windows 判进程存活用不了 `os.kill(pid, 0)`：实测（Python 3.14）它对刚退出但句柄未回收的

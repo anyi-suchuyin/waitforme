@@ -16,7 +16,7 @@ from typing import Any
 
 # rc.json 的默认位置：优先用户目录，便于换机器/换用户时仍然正确
 DEFAULT_RC_PATH = (Path.home() / ".kimi-code" / "server" / "rc.json").as_posix()
-DEFAULT_FALLBACK_URL = "http://10.204.69.40:8791/"
+DEFAULT_FALLBACK_URL = "http://192.168.1.10:8791/"
 
 # OpenProcess 只要查询权限，不申请 PROCESS_TERMINATE —— 误判的代价是不能是杀掉别人的会话
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -73,12 +73,15 @@ def build_links(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         if not data:
             return result
         url = data.get("url")
-        if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
-            result["primary_url"] = url.strip()
-            result["source"] = "rc"
-            device_id = data.get("device_id")
-            if isinstance(device_id, str) and device_id.strip():
-                result["device_id"] = device_id.strip()
+        # 先 strip 再判协议：带前导空格的合法 URL 不该被当成非法而回落 fallback
+        if isinstance(url, str):
+            url = url.strip()
+            if url.lower().startswith(("http://", "https://")):
+                result["primary_url"] = url
+                result["source"] = "rc"
+                device_id = data.get("device_id")
+                if isinstance(device_id, str) and device_id.strip():
+                    result["device_id"] = device_id.strip()
     except Exception:
         # 兜底：这个模块的失败模式必须是「用 fallback」，不是「炸调用方」
         pass

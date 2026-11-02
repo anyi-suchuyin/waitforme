@@ -2,14 +2,17 @@
 
 只用 stdlib（`http.server.ThreadingHTTPServer`）。核心取向：
 
-* **先应答再干活**：无论推不推、判定结果如何，HTTP 都立即 200，推送丢到后台线程。
+* **先应答再干活**：无论推不推、判定结果如何，HTTP 都立即 200，推送丢到有界线程池。
   hook 是别人主流程里的一环，把人家卡住是最糟的失败模式。
+* **额度在应答前就占掉**：判定一过立即同步写预占记录，再回 200、再后台发。否则同一秒
+  进来的同类事件都看到「还有额度」，会一起推出去。
 * **宽容解析**：官方没公开 hook payload 的字段，所以原始 body 一律先落盘
   `logs/events.raw.jsonl`，再递归按候选键名抓值。抓不到不算错 —— 这个文件就是
   以后校准字段映射的依据。
 * **不打扰优先**：事件类型策略 + 限流 + 静默时段，三道门都过才推。
+* **凭证不进日志**：`?k=<hook_token>` 在访问日志里一律打码。
 
-用法：
+用法（无参数不再默认起服务，避免前台静默阻塞）：
     python hooks.py serve              # 前台跑
     python hooks.py serve --detach     # 后台起，pid 写 run/hooks.pid
     python hooks.py stop               # 按 pid 停
@@ -18,8 +21,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -81,6 +87,54 @@ KEY_CANDIDATES: dict[str, tuple[str, ...]] = {
 }
 
 _lock = threading.Lock()
+
+# 推送用的有界线程池：无上限起线程的话，通道卡住时会把进程拖成一堆 10 秒阻塞的线程
+PUSH_WORKERS = 4
+PUSH_QUEUE_LIMIT = 64
+_push_pool = concurrent.futures.ThreadPoolExecutor(max_workers=PUSH_WORKERS, thread_name_prefix="wf-push")
+_pending_lock = threading.Lock()
+_pending = 0
+
+# 访问日志里绝不能留 token
+_TOKEN_IN_URL = re.compile(r"([?&]k=)[^&\s\"']+")
+
+
+def redact_token(line: str) -> str:
+    """把 URL 里的 `?k=<hook_token>` 打成 `?k=***`。"""
+    return _TOKEN_IN_URL.sub(r"\1***", str(line or ""))
+
+
+def _submit_push(cfg: dict[str, Any], found: dict[str, Any], event_name: str, reason: str, urgency: str, reserve_id: str | None) -> str:
+    """把推送丢进有界池。队列满就当场退还额度，别攒一堆迟早发不出去的请求。"""
+    global _pending
+    import policy
+
+    with _pending_lock:
+        if _pending >= PUSH_QUEUE_LIMIT:
+            if reserve_id:
+                policy.cancel_reserve(cfg, reserve_id, "queue_full")
+            log_line(f"[push] 队列已满（{_pending}>={PUSH_QUEUE_LIMIT}），丢弃 {event_name} 并退还额度")
+            return "dropped_queue_full"
+        _pending += 1
+
+    def _run() -> None:
+        global _pending
+        try:
+            do_push(cfg, found, event_name, reason, urgency, reserve_id)
+        finally:
+            with _pending_lock:
+                _pending -= 1
+
+    try:
+        _push_pool.submit(_run)
+    except Exception as exc:  # noqa: BLE001 - 池子挂了也不能影响 HTTP
+        with _pending_lock:
+            _pending -= 1
+        if reserve_id:
+            policy.settle_push(cfg, reserve_id, False, error=f"submit_failed:{type(exc).__name__}")
+        log_line(f"[push] 提交失败：{type(exc).__name__}: {exc}")
+        return "submit_failed"
+    return "queued"
 
 
 # ---------------------------------------------------------------------------
@@ -258,23 +312,43 @@ def build_event_body(found: dict[str, Any], event_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def do_push(cfg: dict[str, Any], found: dict[str, Any], event_name: str, reason: str, urgency: str) -> None:
+def do_push(cfg: dict[str, Any], found: dict[str, Any], event_name: str, reason: str, urgency: str,
+            reserve_id: str | None = None) -> None:
+    """真正发送。额度已在 HTTP 线程里预占过，这里只回填结果。异常一律吞掉只写日志。"""
     try:
         import waitforme
 
         title = f"⏳ Kimi 需要你：{EVENT_ZH.get(event_name, event_name)}"
         body = build_event_body(found, event_name)
         result = waitforme.push_message(cfg, kind=event_name, title=title, body_md=body,
-                                       urgency=urgency, fingerprint_value=found.get("_fp"))
+                                        urgency=urgency, fingerprint_value=found.get("_fp"),
+                                        reserve_id=reserve_id)
         log_line(f"[push] {event_name} ok={result.get('ok')} channel={result.get('channel')} "
-                 f"code={result.get('status_code')} error={result.get('error')} reason={reason} "
-                 f"link={result.get('link_source')}")
+                 f"code={result.get('status_code')} error={redact_token(result.get('error') or '')} "
+                 f"reason={reason} link={result.get('link_source')}")
     except Exception as exc:
         log_line(f"[push] 异常（已吞掉，不影响 HTTP）：{type(exc).__name__}: {exc}\n{traceback.format_exc()[:800]}")
 
 
+def top_level_value(parsed: Any, names: tuple[str, ...]) -> Any:
+    """只认**顶层**键。
+
+    `urgency`/`priority` 决定能不能越静默时段，所以不许从任意嵌套层里抓 —— 实测
+    子结构里一个 `"priority":"high"` 就能把用户的无限推送打开。
+    """
+    if not isinstance(parsed, dict):
+        return None
+    for key in names:
+        for actual, value in parsed.items():
+            if isinstance(actual, str) and actual.lower() == key and isinstance(value, (str, int, float)):
+                return value
+    return None
+
+
 def handle_hook(raw_body: bytes, query: dict[str, list[str]], cfg: dict[str, Any]) -> dict[str, Any]:
-    """解析 → 判定 → 起线程推送。返回给 HTTP 响应用的小摘要。"""
+    """解析 → 判定（并预占额度）→ 丢进有界池推送。返回给 HTTP 响应用的小摘要。"""
+    import policy
+
     text = decode_body(raw_body).strip()
     parsed: Any = None
     parse_error = None
@@ -294,11 +368,9 @@ def handle_hook(raw_body: bytes, query: dict[str, list[str]], cfg: dict[str, Any
 
     found = extract_fields(parsed) if parsed is not None else {}
     event_name = decide_event_name(found, query)
-    urgency = str(found.get("urgency") or "normal").strip().lower()
+    urgency = str(top_level_value(parsed, ("urgency", "priority")) or "normal").strip().lower()
     title = f"⏳ Kimi 需要你：{EVENT_ZH.get(event_name, event_name)}"
     body = build_event_body(found, event_name)
-
-    import policy
 
     found["_fp"] = policy.fingerprint(title, body)
     event = dict(found)
@@ -309,8 +381,11 @@ def handle_hook(raw_body: bytes, query: dict[str, list[str]], cfg: dict[str, Any
     decision = policy.gate(event, cfg, kind=event_name)
     log_line(f"[event] {event_name} allowed={decision['allowed']} reason={decision['reason']} "
              f"fp={found['_fp']} parse_error={parse_error or '-'}")
+    dispatched = None
     if decision["allowed"]:
-        threading.Thread(target=do_push, args=(cfg, found, event_name, decision["reason"], urgency), daemon=True).start()
+        dispatched = _submit_push(cfg, found, event_name, decision["reason"], urgency, decision.get("reserve_id"))
+        if dispatched != "queued":
+            decision = {"allowed": False, "reason": dispatched, "fingerprint": found["_fp"], "urgency": urgency}
     return {"event": event_name, "push": bool(decision["allowed"]), "reason": decision["reason"]}
 
 
@@ -323,12 +398,51 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "waitforme/1.0"
     protocol_version = "HTTP/1.1"
 
-    def _send(self, code: int, payload: dict[str, Any]) -> None:
+    def _read_body(self) -> bytes:
+        """把请求体读干净。
+
+        keep-alive 下不读 body 就发响应，残留字节会被当成下一个请求的开头 ——
+        实测同一个 Session 里先 403 再正常 POST，第二次直接收到 400。
+        """
+        try:
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                chunks, size = [], 0
+                while size < MAX_BODY_BYTES:
+                    line = self.rfile.readline(65536).strip()
+                    if not line:
+                        break
+                    try:
+                        n = int(line.split(b";")[0], 16)
+                    except ValueError:
+                        break
+                    if n == 0:
+                        self.rfile.readline(65536)
+                        break
+                    chunk = self.rfile.read(min(n, MAX_BODY_BYTES - size))
+                    size += len(chunk)
+                    chunks.append(chunk)
+                    self.rfile.readline(65536)
+                return b"".join(chunks)
+            length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY_BYTES)
+        except (ValueError, OSError):
+            return b""
+        if length <= 0:
+            return b""
+        try:
+            return self.rfile.read(length)
+        except (OSError, TimeoutError):
+            return b""
+
+    def _send(self, code: int, payload: dict[str, Any], close: bool = False) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if close:
+            self.send_header("Connection", "close")
         self.end_headers()
+        if close:
+            self.close_connection = True
         try:
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -336,8 +450,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定
         parsed = urlparse(self.path)
+        self._read_body()  # GET 也可能带 body，一律读掉再说
         if parsed.path.rstrip("/") != "/health":
-            self._send(404, {"ok": False, "error": "not_found"})
+            self._send(404, {"ok": False, "error": "not_found"}, close=True)
             return
         try:
             import policy
@@ -350,22 +465,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定
         parsed = urlparse(self.path)
+        raw = self._read_body()
         if parsed.path.rstrip("/") != "/hook":
-            self._send(404, {"ok": False, "error": "not_found"})
+            self._send(404, {"ok": False, "error": "not_found"}, close=True)
             return
         query = parse_qs(parsed.query)
         cfg = load_config()
         token_expected = str(cfg.get("hook_token") or "")
         token_got = (query.get("k") or [""])[0]
-        if not token_expected or token_got != token_expected:
+        # 定长时间比较：`!=` 会因短路在时间上泄露 token 前缀（本机服务也值得防一手）
+        if not token_expected or not hmac.compare_digest(token_got.encode("utf-8"), token_expected.encode("utf-8")):
             log_line("[hook] 403 token 不匹配")
-            self._send(403, {"ok": False, "error": "bad_token"})
+            self._send(403, {"ok": False, "error": "bad_token"}, close=True)
             return
-        try:
-            length = min(int(self.headers.get("Content-Length") or 0), MAX_BODY_BYTES)
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(length) if length > 0 else b""
         try:
             summary = handle_hook(raw, query, cfg)
             self._send(200, {"ok": True, **summary})
@@ -375,7 +487,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "event": "unknown", "push": False, "reason": "handler_error"})
 
     def log_message(self, format: str, *args: Any) -> None:
-        log_line(f"[http] {format % args}")
+        # requestline 原样落盘会把 ?k=<hook_token> 写进日志，必须先打码
+        log_line(f"[http] {redact_token(format % args)}")
 
 
 def serve_forever(host: str, port: int) -> int:
@@ -413,6 +526,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             log_line("[serve] 已有服务在跑，不再重复起")
             print(json.dumps({"status": "already_running", "pid": _running_pid(), "port": port}, ensure_ascii=False))
             return 0
+        # 目录不存在时 open() 会直接抛，后台起不来（实测 exit=1）
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
         RUN_DIR.mkdir(parents=True, exist_ok=True)
         out = (LOGS_DIR / "hooks.stdout.log").open("ab")
         flags = 0
@@ -441,6 +556,7 @@ def _running_pid() -> int | None:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    load_config()  # 让 RUN_DIR / LOGS_DIR 指向配置里的位置，否则找不到别人起的 pid
     pid = _running_pid()
     if not pid:
         print(json.dumps({"status": "not_running", "pid": None}, ensure_ascii=False))
@@ -484,10 +600,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv:
-        argv = ["serve"]
     parser = build_parser()
+    if not argv:
+        # 静默起前台服务会直接把调用方挂住；无参数一律当用法错误
+        parser.print_usage(sys.stderr)
+        print(json.dumps({"status": "usage_error", "reason": "需要子命令 serve|stop"}, ensure_ascii=False))
+        return 2
     args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_usage(sys.stderr)
+        print(json.dumps({"status": "usage_error", "reason": "需要子命令 serve|stop"}, ensure_ascii=False))
+        return 2
     try:
         return int(args.func(args))
     except Exception as exc:

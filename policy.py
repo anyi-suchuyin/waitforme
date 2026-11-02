@@ -1,8 +1,15 @@
 """policy.py —— 推送判定与防打扰。
 
-这里全是（近似）纯函数：判定靠传入的 `event` / `cfg` / `now`，唯一的副作用是读
-`logs/push_log.jsonl` 做历史计数，以及 `record_push()` 追加一行。写日志和发网络的
-事不在这里做，方便单测直接构造 cfg 断言。
+判定靠传入的 `event` / `cfg` / `now`；唯一的副作用是读写 `logs/push_log.jsonl`
+（计数依据 + 额度预占），网络和真正的发送不在这里做，方便单测直接构造 cfg 断言。
+
+两个关键取向：
+
+* **额度是预占的**：判定一过就同步写一条 `reserve` 记录，不等发送结果。否则「读日志 →
+  后台线程发 → 发完才写」中间有几秒空窗，同一秒进来的同类事件会全部放行（实测同一
+  时刻连续两次 gate 都 allowed）。发送结果再补一条 `result`，失败的额度**退还**。
+* **失败不吃额度**：一次断网不该白扣掉当日配额；`ok:false` 的 reserve 会被 refund 掉，
+  但记录仍然留在日志里可观测。
 
 时间一律本地时间：这套东西是给一个人守着自己电脑用的，跨时区没有意义。
 """
@@ -15,6 +22,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +30,8 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 PUSH_LOG_NAME = "push_log.jsonl"
 _append_lock = threading.Lock()
+# 「查额度 + 预占」必须是一个动作，否则并发事件会同时看到「还有额度」
+_gate_lock = threading.RLock()
 
 # 助手文本里出现这些，说明回合停下是在等人回话，不是自己跑完了
 QUESTION_RE = re.compile(r"[?？]|需要你|请选择|要不要|确认|等你|决定")
@@ -33,11 +43,19 @@ DEFAULTS: dict[str, Any] = {
     "max_per_10min": 2,
     "daily_limit": 20,
     "quiet_hours": {"start": "23:00", "end": "08:30"},
-    "dedup_window_s": 60,
+    "dedup_window_s": 600,
 }
+
+# `urgency=="high"` 只越静默时段；额度仍然在，只是放宽成硬上限
+HIGH_MIN_INTERVAL_S = 0
+HIGH_MAX_PER_10MIN = 5
+HIGH_DAILY_LIMIT = 50
 
 # 事件名 → 白名单语义。不在表里的事件默认不推。
 PUSHABLE_EVENTS = ("PermissionRequest", "Notification")
+
+EVENT_RESERVE = "reserve"
+EVENT_RESULT = "result"
 
 
 def _num(cfg: dict[str, Any], key: str, default: float) -> float:
@@ -109,10 +127,6 @@ def _event_fp(event: dict[str, Any]) -> str:
     return fingerprint(str(event.get("title") or ""), _event_text(event))
 
 
-def _recent(cfg: dict[str, Any], window_s: float, now: float) -> list[dict[str, Any]]:
-    return [r for r in read_push_log(cfg) if _rec_ts(r) is not None and now - _rec_ts(r) <= window_s]
-
-
 def _rec_ts(rec: dict[str, Any]) -> float | None:
     raw = rec.get("ts")
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
@@ -125,17 +139,62 @@ def _local_date(ts: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
+def counted_pushes(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """真正占用额度的推送记录 = 预占（reserve）减去被退还的（result ok:false / 已取消）。
+
+    旧格式记录（没有 `event` 字段）按「一次成型」处理：`ok:true` 计，`ok:false` 不计。
+    """
+    records = read_push_log(cfg)
+    refunded = {
+        str(r.get("reserve_id"))
+        for r in records
+        if r.get("event") == EVENT_RESULT and r.get("ok") is False and r.get("reserve_id")
+    }
+    # 取消是另写一行（jsonl 不能改历史），所以要按 id 反查把原始预占一起剔掉
+    cancelled = {
+        str(r.get("reserve_id"))
+        for r in records
+        if r.get("event") == EVENT_RESERVE and r.get("state") == "cancelled" and r.get("reserve_id")
+    }
+    out: list[dict[str, Any]] = []
+    for rec in records:
+        ts = _rec_ts(rec)
+        if ts is None:
+            continue
+        event = rec.get("event")
+        if event == EVENT_RESULT:
+            continue
+        if event == EVENT_RESERVE:
+            rid = str(rec.get("reserve_id"))
+            if rec.get("state") == "cancelled" or rid in refunded or rid in cancelled:
+                continue
+            out.append(rec)
+        elif event is None:
+            if rec.get("ok") is True:
+                out.append(rec)
+    return out
+
+
+def _recent(cfg: dict[str, Any], window_s: float, now: float) -> list[dict[str, Any]]:
+    return [r for r in counted_pushes(cfg) if now - _rec_ts(r) <= window_s]  # type: ignore[operator]
+
+
+def _has_fp(cfg: dict[str, Any], fp: str, window_s: float, now: float) -> bool:
+    """窗口内是否已经为同一段内容占过额度（含还没发完的 pending，这才是去重该有的样子）。"""
+    return any(r.get("fingerprint") == fp for r in _recent(cfg, window_s, now))
+
+
 def should_push(event: dict[str, Any], cfg: dict[str, Any], now: float | None = None) -> tuple[bool, str]:
     """事件类型策略：这类事件值不值得打扰用户？
 
-    返回 `(是否推送, 原因)`。原因串是给日志和人看的，不参与流程判断。
-    只做「事件种类 + Stop 智能判断 + 60s 内容去重」，频率额度在 `throttle_ok` 里。
+    返回 `(是否推送, 原因)`，原因串给日志和人看，不参与流程判断。只管「事件种类 +
+    Stop 智能判断 + 窗口内内容去重（默认 600 秒）」，频率额度在 `throttle_ok` 里。
     """
     now = time.time() if now is None else float(now)
     cfg = dict(DEFAULTS, **(cfg or {}))
     name = _event_name(event)
     fp = _event_fp(event)
-    window = _num(cfg, "dedup_window_s", 60)
+    window = _num(cfg, "dedup_window_s", 600)
 
     if name in PUSHABLE_EVENTS:
         if _has_fp(cfg, fp, window, now):
@@ -170,42 +229,47 @@ def should_push(event: dict[str, Any], cfg: dict[str, Any], now: float | None = 
     return False, f"event_not_pushable:{name}"
 
 
-def _has_fp(cfg: dict[str, Any], fp: str, window_s: float, now: float) -> bool:
-    return any(r.get("fingerprint") == fp for r in _recent(cfg, window_s, now))
+def throttle_reason(kind: str, cfg: dict[str, Any], now: float | None = None, urgency: str = "normal") -> str | None:
+    """被限流时返回原因串，放行时返回 None。`kind` 一般是事件名或 `ask`/`manual`。
 
-
-def throttle_reason(kind: str, cfg: dict[str, Any], now: float | None = None) -> str | None:
-    """被限流时返回原因串，放行时返回 None。`kind` 一般是事件名或 `ask`/`manual`。"""
+    `urgency=="high"` 不再免检：跳过同类间隔，但 10 分钟与当日仍有更宽的硬上限
+    （`HIGH_MAX_PER_10MIN` / `HIGH_DAILY_LIMIT`）。否则 payload 里随便一个
+    `"priority":"high"` 就能把用户手机刷爆。
+    """
     now = time.time() if now is None else float(now)
     cfg = dict(DEFAULTS, **(cfg or {}))
-    history = read_push_log(cfg)
-    valid = [r for r in history if _rec_ts(r) is not None]
+    high = urgency_overrides(urgency)
+    valid = counted_pushes(cfg)
     if not valid:
         return None
 
-    same_kind = [r for r in valid if r.get("kind") == kind]
-    min_interval = _num(cfg, "min_interval_s", 180)
-    if same_kind:
-        gap = now - max(_rec_ts(r) for r in same_kind)
-        if gap < min_interval:
-            return f"min_interval_{int(min_interval)}s_{int(gap)}s_ago"
+    if not high:
+        same_kind = [r for r in valid if r.get("kind") == kind]
+        min_interval = _num(cfg, "min_interval_s", 180)
+        if same_kind and min_interval > 0:
+            gap = max(0.0, now - max(_rec_ts(r) for r in same_kind))  # type: ignore[type-var]
+            if gap < min_interval:
+                return f"min_interval_{int(min_interval)}s_{int(gap)}s_ago"
 
-    per_10min = _num(cfg, "max_per_10min", 2)
-    burst = [r for r in valid if now - _rec_ts(r) <= 600]
-    if per_10min >= 0 and len(burst) >= per_10min:
+    if high:
+        per_10min, day_limit = float(HIGH_MAX_PER_10MIN), float(HIGH_DAILY_LIMIT)
+    else:
+        per_10min, day_limit = _num(cfg, "max_per_10min", 2), _num(cfg, "daily_limit", 20)
+
+    burst = [r for r in valid if now - _rec_ts(r) <= 600]  # type: ignore[operator]
+    if len(burst) >= per_10min:
         return f"max_per_10min_{int(per_10min)}"
 
     today = _local_date(now)
-    day = [r for r in valid if _local_date(_rec_ts(r)) == today]
-    limit = _num(cfg, "daily_limit", 20)
-    if limit >= 0 and len(day) >= limit:
-        return f"daily_limit_{int(limit)}"
+    day = [r for r in valid if _local_date(_rec_ts(r)) == today]  # type: ignore[arg-type]
+    if len(day) >= day_limit:
+        return f"daily_limit_{int(day_limit)}"
     return None
 
 
-def throttle_ok(kind: str, cfg: dict[str, Any], now: float | None = None) -> bool:
+def throttle_ok(kind: str, cfg: dict[str, Any], now: float | None = None, urgency: str = "normal") -> bool:
     """额度判定：同类最小间隔 + 10 分钟突发上限 + 当日上限。三个都过才 True。"""
-    return throttle_reason(kind, cfg, now) is None
+    return throttle_reason(kind, cfg, now, urgency) is None
 
 
 def _parse_hhmm(raw: Any) -> tuple[int, int] | None:
@@ -244,15 +308,73 @@ def in_quiet_hours(cfg: dict[str, Any], now: float | None = None) -> bool:
 
 
 def urgency_overrides(urgency: Any) -> bool:
-    """`high` 表示用户明确要求「一定要吵醒我」，越限静默时段与额度。"""
+    """`high` 只意味着「可以越静默时段」，不再意味着「无限推送」。"""
     return str(urgency or "").strip().lower() == "high"
 
 
-def gate(event: dict[str, Any], cfg: dict[str, Any], kind: str | None = None, now: float | None = None) -> dict[str, Any]:
-    """把三个判定串成一次结论，供 hooks / CLI 复用。
+def reserve_push(cfg: dict[str, Any], kind: str, fp: str, urgency: str = "normal", extra: dict[str, Any] | None = None) -> str:
+    """占一条额度并返回 `reserve_id`。判定通过后必须**立刻**调它，别等发完再记。
 
-    返回 `{allowed, reason, fingerprint, urgency}`。`urgency=="high"` 时跳过静默时段与
-    限流，但**不**跳过事件类型策略 —— 再急也不该把 SubagentStop 推给用户。
+    占位记录里带上 kind/fingerprint，所以后续的同类间隔、突发、当日、去重四项都看得到。
+    """
+    reserve_id = uuid.uuid4().hex[:16]
+    record = {
+        "ts": round(time.time(), 3),
+        "local_time": datetime.now().isoformat(timespec="seconds"),
+        "event": EVENT_RESERVE,
+        "reserve_id": reserve_id,
+        "kind": kind,
+        "fingerprint": fp,
+        "urgency": urgency,
+    }
+    record.update(extra or {})
+    append_line(push_log_path(cfg), json.dumps(record, ensure_ascii=False))
+    return reserve_id
+
+
+def settle_push(cfg: dict[str, Any], reserve_id: str, ok: bool, channel: str = "", status_code: int = 0,
+                error: str | None = None, extra: dict[str, Any] | None = None) -> None:
+    """回填发送结果。`ok:false` 会把这条 reserve 的额度**退还**，失败不该白扣配额。"""
+    record = {
+        "ts": round(time.time(), 3),
+        "local_time": datetime.now().isoformat(timespec="seconds"),
+        "event": EVENT_RESULT,
+        "reserve_id": reserve_id,
+        "ok": bool(ok),
+        "channel": channel,
+        "status_code": int(status_code),
+        "error": error,
+    }
+    record.update(extra or {})
+    append_line(push_log_path(cfg), json.dumps(record, ensure_ascii=False))
+
+
+def cancel_reserve(cfg: dict[str, Any], reserve_id: str, reason: str = "cancelled") -> None:
+    """显式退还一条预占（例如发送前就发现消息组不出来）。"""
+    record = {
+        "ts": round(time.time(), 3),
+        "event": EVENT_RESERVE,
+        "reserve_id": reserve_id,
+        "state": "cancelled",
+        "kind": "__cancelled__",
+        "reason": reason,
+    }
+    append_line(push_log_path(cfg), json.dumps(record, ensure_ascii=False))
+
+
+def record_push(cfg: dict[str, Any], kind: str, fp: str, channel: str, ok: bool, extra: dict[str, Any] | None = None) -> Path:
+    """一次性记录（预占 + 结果同一对），给不走 gate 的调用留的兼容入口。"""
+    reserve_id = reserve_push(cfg, kind, fp, extra={"channel": channel} if channel else None)
+    settle_push(cfg, reserve_id, ok, channel=channel, extra=extra)
+    return push_log_path(cfg)
+
+
+def gate(event: dict[str, Any], cfg: dict[str, Any], kind: str | None = None, now: float | None = None,
+         reserve: bool = True) -> dict[str, Any]:
+    """把三道判定串成一次结论，并在放行的**同一瞬间**预占额度。
+
+    返回 `{allowed, reason, fingerprint, urgency, reserve_id}`。`reserve=False` 时只判不占，
+    给「先看看会不会推」的诊断用。
     """
     now = time.time() if now is None else float(now)
     cfg = dict(DEFAULTS, **(cfg or {}))
@@ -261,17 +383,18 @@ def gate(event: dict[str, Any], cfg: dict[str, Any], kind: str | None = None, no
     fp = _event_fp(event)
     event_kind = kind or _event_name(event)
 
-    allowed, reason = should_push(event, cfg, now)
-    if not allowed:
-        return {"allowed": False, "reason": reason, "fingerprint": fp, "urgency": urgency}
-    if urgency_overrides(urgency):
-        return {"allowed": True, "reason": f"{reason}_high_urgency_skip_limits", "fingerprint": fp, "urgency": urgency}
-    if in_quiet_hours(cfg, now):
-        return {"allowed": False, "reason": "quiet_hours", "fingerprint": fp, "urgency": urgency}
-    blocked = throttle_reason(event_kind, cfg, now)
-    if blocked:
-        return {"allowed": False, "reason": blocked, "fingerprint": fp, "urgency": urgency}
-    return {"allowed": True, "reason": reason, "fingerprint": fp, "urgency": urgency}
+    with _gate_lock:
+        allowed, reason = should_push(event, cfg, now)
+        if not allowed:
+            return {"allowed": False, "reason": reason, "fingerprint": fp, "urgency": urgency, "reserve_id": None}
+        if not urgency_overrides(urgency) and in_quiet_hours(cfg, now):
+            return {"allowed": False, "reason": "quiet_hours", "fingerprint": fp, "urgency": urgency, "reserve_id": None}
+        blocked = throttle_reason(event_kind, cfg, now, urgency)
+        if blocked:
+            return {"allowed": False, "reason": blocked, "fingerprint": fp, "urgency": urgency, "reserve_id": None}
+        reserve_id = reserve_push(cfg, event_kind, fp, urgency, {"title": str(event.get("title") or "")[:80]}) if reserve else None
+    suffix = "_high_skip_quiet_hours" if urgency_overrides(urgency) else ""
+    return {"allowed": True, "reason": f"{reason}{suffix}", "fingerprint": fp, "urgency": urgency, "reserve_id": reserve_id}
 
 
 def append_line(path: Path, line: str) -> None:
@@ -290,41 +413,41 @@ def append_line(path: Path, line: str) -> None:
             os.close(fd)
 
 
-def record_push(cfg: dict[str, Any], kind: str, fp: str, channel: str, ok: bool, extra: dict[str, Any] | None = None) -> Path:
-    """把一次推送尝试追加进 push_log.jsonl —— 限流计数全靠它，失败也要记。"""
-    record = {
-        "ts": round(time.time(), 3),
-        "local_time": datetime.now().isoformat(timespec="seconds"),
-        "kind": kind,
-        "fingerprint": fp,
-        "channel": channel,
-        "ok": bool(ok),
-    }
-    record.update(extra or {})
-    path = push_log_path(cfg)
-    append_line(path, json.dumps(record, ensure_ascii=False))
-    return path
-
-
 def count_today(cfg: dict[str, Any] | None = None, now: float | None = None, only_ok: bool = True) -> int:
-    """今日（本地日历日）的推送次数。默认只算成功的，`--dry-run` 不入日志所以自然不计。"""
+    """今日（本地日历日）占用的推送额度。
+
+    `only_ok=True`（默认）只算已经**确认发送成功**的；算上限时用的是含 pending 的
+    `counted_pushes`，两者口径不同是故意的：状态里给用户看「今天真到了几条」。
+    """
     now = time.time() if now is None else float(now)
     today = _local_date(now)
-    total = 0
-    for rec in read_push_log(cfg):
-        ts = _rec_ts(rec)
-        if ts is None or _local_date(ts) != today:
-            continue
-        if only_ok and not rec.get("ok", False):
-            continue
-        total += 1
-    return total
+    records = read_push_log(cfg)
+    if only_ok:
+        succeed = {
+            str(r.get("reserve_id"))
+            for r in records
+            if r.get("event") == EVENT_RESULT and r.get("ok") is True and r.get("reserve_id")
+        }
+        total = 0
+        for rec in records:
+            ts = _rec_ts(rec)
+            if ts is None or _local_date(ts) != today:
+                continue
+            if rec.get("event") == EVENT_RESULT:
+                continue
+            rid = str(rec.get("reserve_id"))
+            if rec.get("event") == EVENT_RESERVE:
+                if rid in succeed:
+                    total += 1
+            elif rec.get("ok") is True:
+                total += 1
+        return total
+    return sum(1 for r in counted_pushes(cfg) if _local_date(_rec_ts(r)) == today)
 
 
 def last_push_ts(cfg: dict[str, Any] | None = None) -> str:
-    """最后一次推送的本地时间 ISO 串，没有记录就空串。"""
-    stamps = [_rec_ts(r) for r in read_push_log(cfg)]
-    stamps = [s for s in stamps if s is not None]
-    if not stamps:
+    """最后一次占用额度的推送时间（本地 ISO 串），没有记录就空串。"""
+    pushes = counted_pushes(cfg)
+    if not pushes:
         return ""
-    return datetime.fromtimestamp(max(stamps)).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(max(_rec_ts(r) for r in pushes)).isoformat(timespec="seconds")  # type: ignore[type-var]
