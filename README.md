@@ -5,10 +5,19 @@ AI（Kimi Code）干活卡住或需要你拍板时，推一条微信到你手机
 
 不做聊天机器人，不做 Web 面板：只做「该找你的时候找到你，并且一点就能接着干」。
 
+## 获取代码
+
+```bash
+git clone https://github.com/anyi-suchuyin/waitforme.git
+cd waitforme
+```
+
+也可下载 ZIP 解压。建议配合部署指南 PDF（小红书评论区/网盘）一起丢给你的 AI 编程助手安装。
+
 ## 5 分钟上手
 
 ```bash
-cd D:/anyi/waitforme
+# 在 waitforme 项目目录下：
 
 # 1) 生成 config.json（自动写入随机 hook_token）
 python waitforme.py init
