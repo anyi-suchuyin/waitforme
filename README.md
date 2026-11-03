@@ -1,7 +1,7 @@
 # waitforme —— AI 卡住时，一条能点开的微信
 
-AI（Kimi Code）干活卡住或需要你拍板时，推一条微信到你手机，消息里带**可点击的跳转链接**，
-点开就是手机上的 Kimi Code 远程控制页，你在那里回一句话即可。
+AI（Kimi Code）干活卡住或需要你拍板时，推一条消息到你手机（微信 / 企业微信 / 飞书），
+消息里带**可点击的跳转链接**，点开就是 Kimi Code 远程控制页，你在那里回一句话即可。
 
 不做聊天机器人，不做 Web 面板：只做「该找你的时候找到你，并且一点就能接着干」。
 
@@ -30,7 +30,7 @@ hook 默认走**零常驻直发**：事件来了起一个短命进程，过三�
 
 配合 `资料/waitforme部署指南.pdf`（Skill 安装指南）一起丢给 AI 更省事。
 
-## 手动 5 分钟上手
+## 手动 5 分钟上手（常驻服务模式，可选）
 
 ```bash
 # 在 waitforme 项目目录下：
@@ -59,11 +59,11 @@ python hooks.py stop
 自测（默认离线，不联网、不污染真实 `logs/`；含 40 线程并发写与 8 并发 hook 的回归）：
 
 ```bash
-python selftest.py          # 272 项断言，全绿退出 0
+python selftest.py          # 289 项断言，全绿退出 0
 python selftest.py --live   # 再真发一条；通道没配就 SKIP
 ```
 
-## 作为 Skill 安装（交给 AI 助手）
+### Skill 安装细节（放哪儿 / 手动跑）
 
 仓库里的 `skill/` 目录是一个符合 Agent Skills 规范的安装包：`SKILL.md` + 安装/配置/验证脚本。
 装好后，**新会话**里说一句「安装 waitforme skill」或「配置 waitforme」，AI 就会自己读流程往下做。
@@ -93,14 +93,14 @@ Copy-Item -Recurse skill "$HOME\.kimi-code\skills\waitforme"
 
 ```bash
 python "$HOME/.kimi-code/skills/waitforme/scripts/install.py"            # 找项目 → init → 选通道
-python "$HOME/.kimi-code/skills/waitforme/scripts/verify.py" --service   # 含 272 项自检
+python "$HOME/.kimi-code/skills/waitforme/scripts/verify.py"              # 含 289 项自检
 ```
 
 如果只复制了 `skill/`、本机又没有 waitforme 仓库，安装器会提示三选一：`--project <目录>`、
 `--clone`（克隆到 `~/waitforme`）、或手动 clone。把 hook 接到 Kimi Code 那一步**不会自动改配置**：
 `connect_kimi.py` 只打印 `[[hooks]]` 片段和可直接 review 的 patch，写不写由你决定。
 
-## 三个微信通道，选一个
+## 三个推送通道，选一个
 
 | 通道 | 怎么拿 key | 填哪儿 |
 |---|---|---|
@@ -164,6 +164,9 @@ python waitforme.py status
 手动 `send` / `ask` 是你的明确意图，绕过限流但仍受 `enabled` 开关约束；它们**会**计入历史，
 所以手动发多了，随后的自动推送会被额度拦下 —— 这是想要的行为。
 
+零常驻直发（`hook_direct.py`）走的是**同一套** `policy.gate`：去重、静默、180s 同类间隔、
+10 分钟 2 条、当日 20 条全部生效；只有显式 `--urgency high` 才跳过静默与同类间隔。
+
 ## 文件
 
 ```
@@ -173,7 +176,7 @@ channels.py        四个通道适配器，统一 send(...) -> {"ok","channel","
 linker.py          从 ~/.kimi-code/server/rc.json 读远程控制链接，读不到退 fallback
 policy.py          事件策略 / 限流 / 静默时段 / 内容指纹（纯函数，好单测）
 config.example.json 配置模板（config.json 由 init 生成，已被 gitignore）
-selftest.py        272 项离线断言 + 可选 --live
+selftest.py        289 项离线断言 + 可选 --live
 ```
 
 运行时产物（都不进版本库）：

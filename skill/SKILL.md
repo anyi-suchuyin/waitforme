@@ -1,6 +1,6 @@
 ---
 name: waitforme
-description: 安装、配置并验证 waitforme —— AI 卡住或需要你拍板时，把一条带可点击跳转链接的微信推到你手机。当用户说「安装 waitforme skill」「装/配置 waitforme」「让 Kimi 卡住时微信通知我」「把 hook 接到 Kimi Code」「waitforme 收不到消息 / 不推送 / 怎么配通道」时使用。包含安装器、通道配置向导、Kimi Code hooks 接入片段、以及 272 项离线自检。
+description: 安装、配置并验证 waitforme —— AI 卡住或需要你拍板时，把一条带可点击跳转链接的消息推到你手机（微信/企业微信/飞书）。当用户说「安装 waitforme skill」「装/配置 waitforme」「让 Kimi 卡住时微信通知我」「把 hook 接到 Kimi Code」「waitforme 收不到消息 / 不推送 / 怎么配通道」时使用。包含安装器、通道配置向导、Kimi Code hooks 接入片段、以及 289 项离线自检。
 type: prompt
 whenToUse: 用户要安装、配置、验证或排错 waitforme；或想把 Kimi Code 的 hook 事件接到本地推送服务时
 ---
@@ -8,7 +8,7 @@ whenToUse: 用户要安装、配置、验证或排错 waitforme；或想把 Kimi
 # waitforme：AI 卡住时，一条能点开的微信
 
 waitforme 的核心能力：Kimi Code 的 hook 事件进来，按「事件类型 / 静默时段 / 限流」三道门
-判断该不该打扰你，该推就推一条微信，消息里带 **可点击的跳转链接**，点开是手机上的 Kimi
+判断该不该打扰你，该推就推一条消息（微信/企业微信/飞书），消息里带 **可点击的跳转链接**，点开是手机上的 Kimi
 Code 远程控制页。
 
 **两种接法，默认零常驻：**
@@ -18,7 +18,7 @@ Code 远程控制页。
   适合想集中看 `/health`、或一个服务接多个来源的场景。
 
 本 skill 负责把它装好、配好、验证好。**核心代码（`waitforme.py` / `hooks.py` /
-`channels.py` / `linker.py` / `policy.py`）不要改**，改了就偏离了上游，且必须重跑 272 项自检。
+`channels.py` / `linker.py` / `policy.py`）不要改**，改了就偏离了上游，且必须重跑 289 项自检。
 
 ## AI 执行清单（照着做，别跳步）
 
@@ -76,7 +76,7 @@ python "${KIMI_SKILL_DIR}/scripts/install.py" --non-interactive --channel mock
 # ② 起常驻服务（后台，pid 写 run/hooks.pid）
 python "<项目目录>/hooks.py" serve --detach
 
-# ③ 验证：status + mock 消息 + 272 项自检 + 服务起停
+# ③ 验证：status + mock 消息 + 289 项自检 + 服务起停
 python "${KIMI_SKILL_DIR}/scripts/verify.py" --service
 ```
 
@@ -212,7 +212,7 @@ echo '{"hook_event_name":"Notification","message":"手工验证"}' | python "<sk
 ## 5. 验证
 
 ```bash
-python "${KIMI_SKILL_DIR}/scripts/verify.py"                 # 标准验证（约 20 秒，含 272 项自检）
+python "${KIMI_SKILL_DIR}/scripts/verify.py"                 # 标准验证（约 20 秒，含 289 项自检）
 python "${KIMI_SKILL_DIR}/scripts/verify.py" --service       # 额外真起一次服务、探活、停掉
 python "${KIMI_SKILL_DIR}/scripts/verify.py" --live          # 额外真发一条到手机
 python "${KIMI_SKILL_DIR}/scripts/verify.py" --skip-selftest # 快速检查（少一半证据）
@@ -225,7 +225,7 @@ python "${KIMI_SKILL_DIR}/scripts/verify.py" --skip-selftest # 快速检查（�
 | `config` | config.json 路径 | 跑 `install.py` |
 | `status` | `pid_exists=... port=8790 channel=... today=0` | 跑 `init`；看 stderr |
 | `test_mock` | `status=preview link_kept=True` | `link_kept=False` = 消息把跳转链接挤掉了 |
-| `selftest` | `PASS 272 / FAIL 0` | 手动跑 `python selftest.py` 看第一个 FAIL |
+| `selftest` | `PASS 289 / FAIL 0` | 手动跑 `python selftest.py` 看第一个 FAIL |
 | `service` | `health ok，pid=...` | `logs/hooks.stdout.log`；端口冲突 |
 | `service_stop` | `stop=stopped health_after=False` | pid 文件在 `run/hooks.pid` |
 | `test_live` | `status=sent` | key 错 / 网络 / 静默时段（用 `--force`） |
@@ -289,7 +289,7 @@ python hooks.py stop                           # 停服务
 ## 9. 安全边界（给 AI 的硬规则）
 
 1. 不改 `waitforme.py` / `hooks.py` / `channels.py` / `linker.py` / `policy.py`；确需改动，
-   必须 `python selftest.py` 保持 `PASS 272 / FAIL 0`。
+   必须 `python selftest.py` 保持 `PASS 289 / FAIL 0`。
 2. 不自动改 `~/.kimi-code/config.toml`（或任何用户配置）。只打印片段 + patch，让用户确认。
 3. 不把真实 key / token 写进仓库、日志、提交信息；示例一律用占位符。
 4. 不 `git push`，不改 git 历史。
