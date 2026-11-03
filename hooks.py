@@ -84,6 +84,9 @@ KEY_CANDIDATES: dict[str, tuple[str, ...]] = {
     "transcript_path": ("transcript_path", "transcriptpath", "transcript"),
     "duration_s": ("duration_s", "duration", "elapsed_s", "elapsed"),
     "urgency": ("urgency", "priority"),
+    "tool_name": ("tool_name", "toolname", "tool"),
+    "tool_command": ("command", "cmd", "script", "shell_command", "bash_command",
+                     "tool_input", "toolinput", "input", "arguments", "args"),
 }
 
 _lock = threading.Lock()

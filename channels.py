@@ -32,7 +32,9 @@ _append_lock = threading.Lock()
 
 HERE = Path(__file__).resolve().parent
 NET_TIMEOUT_S = 10
-CLOSER = "[👉 点击打开会话继续对话]({url})"
+CLOSER = "[👉 在系统浏览器打开]({url})"
+LINK_HINT = ("微信/企业微信内置浏览器打不开这个页面：点右上角「···」→「在浏览器打开」，"
+             "或长按复制下面的链接到 Safari / Chrome：\n{url}")
 NO_LINK_NOTE = "> 本次没有可用跳转链接，请回到电脑前操作"
 VALID_CHANNELS = ("mock", "wecom_bot", "feishu", "pushplus")
 
@@ -122,8 +124,11 @@ def clip_title(title: str, max_chars: int) -> str:
     return text[: max_chars - 1] + "…"
 
 
-def build_content(title: str, body_md: str, url: str, urgency: str = "normal", max_bytes: int | None = None) -> str:
-    """组一条通道通用的 markdown 正文：`###` 标题 + 正文 + 末尾链接。
+def build_content(title: str, body_md: str, url: str, urgency: str = "normal",
+                  max_bytes: int | None = None, headline: bool = True) -> str:
+    """组一条通道通用的 markdown 正文：可选 `###` 标题 + 正文 + 链接 + 复制提示。
+
+    `headline=False` 用于已经有独立标题字段的通道（pushplus / 飞书），避免标题重复两遍。
 
     排版只用企业微信 markdown 认的东西（`###`、`>`、换行、`[]()`）；实测 `**加粗**`
     在企微里原样显示成星号，所以一律不用星号，重要信息靠引用块和独立成行突出。
@@ -136,44 +141,48 @@ def build_content(title: str, body_md: str, url: str, urgency: str = "normal", m
     safe_title = redact_secrets(title) or "Kimi 需要你"
     body = redact_secrets((body_md or "").strip())
     closer = CLOSER.format(url=url) if url else NO_LINK_NOTE
+    hint = LINK_HINT.format(url=url) if url else ""
 
     def head_of(t: str) -> str:
-        return f"### {mark}{t}"
+        return f"### {mark}{t}" if headline else ""
 
-    def join(head: str, b: str) -> str:
-        parts = [head]
-        if b:
-            parts.append(b)
-        parts.append(closer)
+    def compose(head: str, b: str, with_hint: bool = True) -> str:
+        parts = [part for part in (head, b, closer) if part]
+        if with_hint and hint:
+            parts.append(hint)
         return "\n\n".join(parts)
 
-    content = join(head_of(safe_title), body)
+    content = compose(head_of(safe_title), body)
     if max_bytes is None:
         return content
     if _fits(content, max_bytes):
         return content
 
-    # 固定开销 = 标题行 + 链接行 + 中间的空行分隔
-    overhead = len(join(head_of(safe_title), "").encode("utf-8")) + 2
-    budget = max_bytes - overhead
-    if budget < 0:
-        # 连标题+链接都超预算：砍标题长度，链接一个字不动
-        for keep in (20, 12, 8, 4, 1):
-            short_head = head_of(clip_title(safe_title, keep))
-            overhead = len(join(short_head, "").encode("utf-8")) + 2
+    # 降级顺序：先砍正文（保留复制提示）→ 丢掉复制提示 → 缩标题 → 只留链接
+    head = head_of(safe_title)
+    for with_hint in (True, False):
+        overhead = len(compose(head, "", with_hint).encode("utf-8")) + 2
+        budget = max_bytes - overhead
+        if budget >= 0:
+            candidate = compose(head, _truncate_utf8(body, budget), with_hint)
+            if _fits(candidate, max_bytes):
+                return candidate
+
+    for keep in (20, 12, 8, 4, 1):
+        short_head = head_of(clip_title(safe_title, keep))
+        for with_hint in (True, False):
+            overhead = len(compose(short_head, "", with_hint).encode("utf-8")) + 2
             budget = max_bytes - overhead
             if budget >= 0:
-                content = join(short_head, _truncate_utf8(body, budget))
-                break
-        else:
-            content = f"### {mark}\n\n{closer}"
-    else:
-        content = join(head_of(safe_title), _truncate_utf8(body, budget))
+                candidate = compose(short_head, _truncate_utf8(body, budget), with_hint)
+                if _fits(candidate, max_bytes):
+                    return candidate
 
-    if url and url not in content:
-        # 最后一道保险：链接没了就把正文整段丢掉，只留标题+链接（宁可少信息不可没链接）
-        content = join(head_of(clip_title(safe_title, 20)), "")
-    return content
+    # 极端情况：正文、标题、提示全放弃，只保留链接原文
+    for candidate in (compose("", "", False), compose("", "", True), url):
+        if candidate and _fits(candidate, max_bytes):
+            return candidate
+    return url or closer
 
 
 def _fits(text: str, max_bytes: int) -> bool:
@@ -206,7 +215,9 @@ def send(cfg: dict[str, Any], title: str, body_md: str, url: str, urgency: str =
     name = resolve_channel(cfg, channel)
     limits = channel_limits(name)
     t_title = clip_title(title or "Kimi 需要你", limits["title_chars"])
-    content = build_content(t_title, body_md, url, urgency, max_bytes=limits["max_bytes"])
+    # 企微的 markdown 没有独立标题字段，靠首行；pushplus/飞书有 title 字段，正文不再重复
+    content = build_content(t_title, body_md, url, urgency, max_bytes=limits["max_bytes"],
+                            headline=name in ("wecom_bot", "mock"))
     try:
         if name == "mock":
             return _send_mock(cfg, t_title, content, url, urgency)
@@ -285,7 +296,10 @@ def _send_feishu(cfg: dict[str, Any], title: str, body_md: str, url: str,
     if not paragraphs:
         paragraphs.append([{"tag": "text", "text": "Kimi 需要你"}])
     if url:
-        paragraphs.append([{"tag": "a", "text": "👉 点开继续", "href": url}])
+        paragraphs.append([{"tag": "a", "text": "👉 在系统浏览器打开", "href": url}])
+        paragraphs.append([{"tag": "text",
+                           "text": "微信/企业微信内置浏览器打不开：点右上角「···」→「在浏览器打开」，"
+                                   f"或长按复制链接：{url}"}])
     else:
         paragraphs.append([{"tag": "text", "text": "本次没有可用跳转链接，请回到电脑前操作"}])
 

@@ -264,6 +264,8 @@ python hooks.py stop                           # 停服务
 | 端口占用 `bind_failed` | 8790 被别的程序占了 | 改 `hook_port`，再改 Kimi 片段（片段是桥脚本读 config，不用改） |
 | `hook 收不到事件` | Kimi config 没生效 / 写错字段 | 开新会话；`[[hooks]]` 只许四个字段；手工 `echo ... \| kimi_hook.py --debug` |
 | `selftest` 偶发 FAIL | 时间相关的限流/静默断言 | 重跑一次；仍失败就把 FAIL 行贴出来，别改核心代码 |
+| 微信里点链接提示「请使用浏览器打开」 | 微信/企业微信内置浏览器不支持 Kimi Code 远程页 | 点右上角 `···` → 在浏览器打开；或长按消息里那条纯文本链接复制到 Safari/Chrome（推送正文已带复制提示） |
+| 推送看不出要决策什么 | payload 里没有工具/命令字段 | 看 `logs/events.raw.jsonl` 的真实字段；`hook_direct.py` 已按 `tool_name`/`command`/`message` 尽力提取 |
 | 中文乱码 | 控制台不是 UTF-8 | 本 skill 脚本已 `reconfigure`；项目脚本也有；还乱就是终端本身 |
 
 ## 8. 常见坑

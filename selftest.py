@@ -185,7 +185,8 @@ def test_markdown() -> None:
 
     content = channels.build_content("⏳ 要你拍板：billing 历史数据动不动", body, "http://x.example/rc", "normal")
     check("完整消息含标题", content.startswith("### ⏳ 要你拍板：billing 历史数据动不动"), content[:60])
-    check("完整消息含链接", "[👉 点击打开会话继续对话](http://x.example/rc)" in content)
+    check("完整消息含链接", "[👉 在系统浏览器打开](http://x.example/rc)" in content)
+    check("消息含复制到系统浏览器的提示", "内置浏览器打不开" in content and "http://x.example/rc" in content)
     check("完整消息含选项", "稳妥重构" in content)
     check("high 标题加红点", channels.build_content("t", "b", "u", "high").startswith("### 🔴"))
     no_url = channels.build_content("t", "b", "", "normal")

@@ -132,24 +132,84 @@ def short(text: str, limit: int) -> str:
     return text[:limit] + "…" if len(text) > limit else text
 
 
+def gather_pairs(data: object) -> list[tuple[str, object]]:
+    """把 payload 拍平成 (小写键, 值) 列表，供宽容查找。"""
+    pairs: list[tuple[str, object]] = []
+    stack: list[object] = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                pairs.append((str(key).lower(), value))
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return pairs
+
+
+def pick(pairs: list[tuple[str, object]], names: tuple[str, ...]) -> str:
+    """按候选键名取第一个非空标量；遇到 dict 时再往里看一层常见字段。"""
+    nested_keys = ("command", "cmd", "description", "query", "url", "path", "tool_name", "tool")
+    for name in names:
+        for key, value in pairs:
+            if key != name:
+                continue
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return str(value).strip()
+            if isinstance(value, dict):
+                for inner in nested_keys:
+                    inner_value = value.get(inner)
+                    if isinstance(inner_value, str) and inner_value.strip():
+                        return inner_value.strip()
+    return ""
+
+
 def build_message(event: str, data: dict) -> tuple[str, str]:
-    """返回 (标题后缀, markdown 正文)；标题前缀在 callsite 统一加。"""
-    title = EVENT_TITLE.get(event, event)
-    message = first_text(data, ("message", "last_assistant_message", "text", "content"))
-    cwd = first_text(data, ("cwd", "project_dir", "working_dir"))
-    session = first_text(data, ("session_id", "sessionId", "session"))
-    parts: list[str] = []
-    if message:
-        parts.append(f"「{short(message, 200)}」")
-    meta: list[str] = []
+    """返回 (标题后缀, 正文)：正文要讲清「卡在哪」和「要你决定什么」。"""
+    pairs = gather_pairs(data)
+    message = pick(pairs, ("message", "msg", "text", "content", "body"))
+    last_message = pick(pairs, ("last_assistant_message", "lastassistantmessage",
+                                "assistant_message", "response"))
+    tool = pick(pairs, ("tool_name", "toolname", "tool"))
+    command = pick(pairs, ("command", "cmd", "script", "shell_command", "bash_command"))
+    if not command:
+        command = pick(pairs, ("tool_input", "toolinput", "input", "arguments", "args",
+                               "parameters", "request", "permission"))
+    notification_type = pick(pairs, ("notification_type", "notificationtype"))
+    cwd = pick(pairs, ("cwd", "working_dir", "workingdir", "project_path", "workdir"))
+    session = pick(pairs, ("session_id", "sessionid", "session", "conversation_id"))
+
+    summary = message or last_message
+    if event == "PermissionRequest":
+        label = tool or ("命令" if command else "")
+        title = f"等你授权：{label}" if label else "等你授权"
+        what = summary or (f"请求执行 {tool or '一个操作'}" if tool else "Kimi 请求执行一个操作")
+        lines = [f"Kimi 卡在这里：{short(what, 120)}"]
+        if command:
+            lines.append(f"命令：{short(command, 160)}")
+        lines += ["", "要你决定：批准还是拒绝？（回「批准」或「拒绝」，也可以直接说你的决定）"]
+    elif event == "Notification":
+        label = short(summary or notification_type, 16)
+        title = f"有新通知：{label}" if label else "有新通知"
+        what = summary or "Kimi 发来一条通知"
+        lines = [f"Kimi 发来通知：{short(what, 140)}"]
+        if notification_type:
+            lines.append(f"类型：{notification_type}")
+        lines += ["", "要你决定：看一眼，需要的话回一句。"]
+    else:
+        title = EVENT_TITLE.get(event, event)
+        what = summary or "Kimi 有一个动作需要你确认"
+        lines = [f"Kimi 卡在这里：{short(what, 140)}", "", "要你决定：看一眼，需要的话回一句。"]
+
+    details: list[str] = []
     if cwd:
-        meta.append(f"目录：{Path(cwd).name or cwd}")
+        details.append(f"目录：{Path(cwd).name or cwd}")
     if session:
-        meta.append(f"会话：{session[:8]}")
-    if meta:
-        parts.append(" / ".join(meta))
-    parts.append("手机点下面的链接，回一句话就行。")
-    return title, "\n\n".join(parts)
+        details.append(f"会话：{session[:8]}")
+    if details:
+        lines += ["", " / ".join(details)]
+    return title, "\n".join(lines)
 
 
 def push_with_gates(cfg: dict, event: str, title: str, body: str, urgency: str,
