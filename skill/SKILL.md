@@ -7,9 +7,15 @@ whenToUse: 用户要安装、配置、验证或排错 waitforme；或想把 Kimi
 
 # waitforme：AI 卡住时，一条能点开的微信
 
-waitforme 是一个本地小服务：Kimi Code 的 hook 事件 POST 到 `127.0.0.1:8790/hook`，
-它按「事件类型 / 静默时段 / 限流」三道门判断该不该打扰你，该推就推一条微信，消息里带
-**可点击的跳转链接**，点开是手机上的 Kimi Code 远程控制页。
+waitforme 的核心能力：Kimi Code 的 hook 事件进来，按「事件类型 / 静默时段 / 限流」三道门
+判断该不该打扰你，该推就推一条微信，消息里带 **可点击的跳转链接**，点开是手机上的 Kimi
+Code 远程控制页。
+
+**两种接法，默认零常驻：**
+- **直发（默认，推荐）**：事件来了起一个短命进程 → 直接调 `waitforme.py send` → 立刻退出。
+  不占端口、不用开机自启、不需要服务一直跑。
+- **常驻服务（可选）**：`hooks.py serve` 一直在跑，桥脚本 POST 到 `127.0.0.1:8790`。
+  适合想集中看 `/health`、或一个服务接多个来源的场景。
 
 本 skill 负责把它装好、配好、验证好。**核心代码（`waitforme.py` / `hooks.py` /
 `channels.py` / `linker.py` / `policy.py`）不要改**，改了就偏离了上游，且必须重跑 272 项自检。
@@ -19,9 +25,10 @@ waitforme 是一个本地小服务：Kimi Code 的 hook 事件 POST 到 `127.0.0
 1. `install.py --check` 看清现状（项目在哪、config 在不在、什么通道）。
 2. 项目找不到 → 问用户要路径，或 `--clone` 克隆一份。
 3. `install.py --non-interactive --channel mock` 先离线装通（不联网、不打扰人）。
-4. `hooks.py serve --detach` 起服务，`verify.py --service` 验证起停。
+4. **直发模式不用起服务**：直接测 `echo '{"hook_event_name":"Notification"}' | python scripts/hook_direct.py --debug`。
+   只有用户明确要常驻时，才 `hooks.py serve --detach` + `verify.py --service`。
 5. 问用户要真实通道和 key → `configure.py` 写入 → `verify.py --live` 真发一条。
-6. `connect_kimi.py` 打印 hooks 片段和 patch → **给用户看，用户自己决定写不写**。
+6. `connect_kimi.py --mode direct` 打印 hooks 片段/替换 patch → **给用户看，用户自己决定写不写**。
 7. 用户写完后开**新会话**，hooks 才生效。
 
 每一步的 stdout 最后一行都是 JSON；过程提示在 stderr。退出码：`0` 成功 / `2` 业务失败 / `1` 异常。
@@ -123,40 +130,62 @@ python "${KIMI_SKILL_DIR}/scripts/verify.py" --live
 ## 4. 接 Kimi Code hooks（必须用户确认后再改）
 
 原理（别搞错）：Kimi Code 的 hook 是「**跑一条命令，事件 JSON 从 stdin 进来**」，
-不是「POST 一个 URL」。所以中间要一个桥：`kimi_hook.py` 读 stdin → POST 到
-`http://127.0.0.1:8790/hook?k=<hook_token>`。它**永远 exit 0**（Stop 是可阻断事件，
-退出码 2 会把用户的回合拦下来），也不打印 stdout（stdout 可能进模型上下文）。
+不是「POST 一个 URL」。所以中间要一个桥脚本。
+
+### 4a. 零常驻直发（默认，推荐）
+
+`hook_direct.py`：读 stdin → 直接调 `waitforme.py send`（短命进程）→ 退出。
+**完全不碰 8790**，不需要常驻服务。6 条硬约束：
+
+| # | 约束 | 实现 |
+|---|---|---|
+| 1 | 事件名取 `hook_event_name`，容错 `event`/`type`，大小写与 `-`/`_` 归一 | `normalize_event()` |
+| 2 | 不碰 8790 服务，直接走 `waitforme.py send` | `run_send()` |
+| 3 | **恒 exit 0**（Stop 是可阻断事件） | 顶层 `BaseException` 兜底 |
+| 4 | **stdout 必须为空**，调试只走 `--debug` + stderr | 子进程 stdout=DEVNULL |
+| 5 | 自控超时（hook timeout=10 → 内部 8s），超时也 exit 0 | `--timeout` / `WAITFORME_HOOK_TIMEOUT` |
+| 6 | PermissionRequest / Notification → 推；Stop 及其它 → 只写 `logs/hook_direct.log` | `PUSH_EVENTS` |
 
 ```bash
-python "${KIMI_SKILL_DIR}/scripts/connect_kimi.py"                 # 打印片段 + patch
-python "${KIMI_SKILL_DIR}/scripts/connect_kimi.py" --write-patch out.patch   # 存成文件给用户看
-python "${KIMI_SKILL_DIR}/scripts/connect_kimi.py" --target claude           # Claude Code 版
+python "${KIMI_SKILL_DIR}/scripts/connect_kimi.py" --mode direct    # 默认就是 direct
 ```
 
-输出（片段会带上**本机** Python 与桥脚本的绝对路径）：
+输出片段（路径是本机的）：
 
 ```toml
-# === waitforme：把 Kimi Code 的 hook 事件转给本地服务 ===
+# === waitforme：零常驻直发（事件来了起进程 → 发微信 → 退出）===
 [[hooks]]
 event = 'Stop'
-command = '"C:\Python314\python.exe" "C:\Users\...\skills\waitforme\scripts\kimi_hook.py"'
+command = '"C:\Python314\python.exe" "...\skills\waitforme\scripts\hook_direct.py"'
 timeout = 10
 
 [[hooks]]
 event = 'PermissionRequest'
-command = '"C:\Python314\python.exe" "...\kimi_hook.py"'
+command = '"C:\Python314\python.exe" "...\hook_direct.py"'
 timeout = 10
 
 [[hooks]]
 event = 'Notification'
-command = '"C:\Python314\python.exe" "...\kimi_hook.py"'
+command = '"C:\Python314\python.exe" "...\hook_direct.py"'
 timeout = 10
+```
+
+**如果 config.toml 里已经有 `kimi_hook.py`**：不要追加，会双推。`connect_kimi.py`
+会自动改出「替换 patch」（把 3 处 `kimi_hook.py` 换成 `hook_direct.py`）。
+
+### 4b. 常驻服务（可选）
+
+`kimi_hook.py` 读 stdin → POST 到 `http://127.0.0.1:8790/hook?k=<hook_token>`。
+需要 `hooks.py serve --detach` 一直在跑，否则事件被静默丢弃。
+
+```bash
+python "${KIMI_SKILL_DIR}/scripts/connect_kimi.py" --mode service
 ```
 
 **硬规则**：`~/.kimi-code/config.toml` 是用户的文件。
 - 只打印片段 / patch，**不要自动写、不要用 sed 追加**。
-- 给用户看 patch，明确说「追加到文件末尾」，用户同意后由用户自己动手（或用户明确授权你改）。
-- 已经出现过 `kimi_hook.py` 就别重复追加，否则同一事件跑两遍。
+- 给用户看 patch，明确说「追加 / 替换」，用户同意后由用户自己动手（或用户明确授权你改）。
+- 已经出现过同名桥脚本就别重复追加，否则同一事件跑两遍。
 - `[[hooks]]` **只允许** `event` / `matcher` / `command` / `timeout` 四个字段，多一个整个
   config 都加载失败。
 - 改完要**开新会话**才生效（Kimi Code 启动时读 config）。
@@ -164,10 +193,13 @@ timeout = 10
 片段配好后，先手工发一条事件验证桥是通的（不会真打扰，除非策略判定该推）：
 
 ```bash
-echo '{"hook_event_name":"Stop","session_id":"manual-test","cwd":"."}' | python "<skill>/scripts/kimi_hook.py" --debug
+# 直发模式：Stop 只写日志
+echo '{"hook_event_name":"Stop","session_id":"manual-test","cwd":"."}' | python "<skill>/scripts/hook_direct.py" --debug
+# 想看推送：用 Notification 或 PermissionRequest
+echo '{"hook_event_name":"Notification","message":"手工验证"}' | python "<skill>/scripts/hook_direct.py" --debug
 ```
 
-`--debug` 会打印 `[hook-bridge] ok: HTTP 200 {"ok": true, "event": "Stop", ...}`。
+`--debug` 会打印 `[hook-direct] Notification → sent: ok`（或失败原因）。
 
 ## 5. 验证
 

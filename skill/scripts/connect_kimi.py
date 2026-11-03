@@ -29,7 +29,8 @@ import _common as C  # noqa: E402
 
 DEFAULT_EVENTS = ("Stop", "PermissionRequest", "Notification")
 KIMI_CONFIG = Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code") / "config.toml"
-BRIDGE = C.SCRIPTS_DIR / "kimi_hook.py"
+BRIDGE = C.SCRIPTS_DIR / "kimi_hook.py"          # 旧：POST 到常驻服务
+DIRECT = C.SCRIPTS_DIR / "hook_direct.py"        # 新：短命进程直发，零常驻
 EXIT_OK = 0
 EXIT_BUSINESS = 2
 
@@ -41,10 +42,19 @@ def toml_str(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def build_snippet(python_exe: str, bridge: Path, events: tuple[str, ...]) -> str:
+def build_snippet(python_exe: str, bridge: Path, events: tuple[str, ...], mode: str = "direct") -> str:
     command = f'"{python_exe}" "{bridge}"'
-    lines = [
-        "# === waitforme：把 Kimi Code 的 hook 事件转给本地服务 ===",
+    if mode == "direct":
+        header = [
+            "# === waitforme：零常驻直发（事件来了起进程 → 发微信 → 退出）===",
+            "# 不依赖 8790 常驻服务；Stop 等非推送事件只写 logs/hook_direct.log",
+        ]
+    else:
+        header = [
+            "# === waitforme：把 Kimi Code 的 hook 事件转给本地常驻服务 ===",
+            "# 需要 hooks.py serve 一直在跑；否则事件会被静默丢弃",
+        ]
+    lines = header + [
         "# 追加到 ~/.kimi-code/config.toml 末尾；[[hooks]] 只认 event/matcher/command/timeout 四个字段",
     ]
     for event in events:
@@ -84,14 +94,15 @@ def claude_snippet(python_exe: str, bridge: Path, events: tuple[str, ...]) -> st
 
 
 def render_report(project: Path, config: Path, events: tuple[str, ...] = DEFAULT_EVENTS,
-                  target: str = "kimi") -> dict:
+                  target: str = "kimi", mode: str = "direct") -> dict:
     """把「要打印什么」算清楚，打印和 JSON 摘要共用一份事实。"""
     cfg = C.read_config(config)
     token = str(cfg.get("hook_token") or "")
     python_exe = sys.executable
-    bridge_ok = BRIDGE.is_file()
+    bridge = DIRECT if mode == "direct" else BRIDGE
+    bridge_ok = bridge.is_file()
 
-    snippet = build_snippet(python_exe, BRIDGE, events) if target == "kimi" else claude_snippet(python_exe, BRIDGE, events)
+    snippet = build_snippet(python_exe, bridge, events, mode) if target == "kimi" else claude_snippet(python_exe, bridge, events)
     existing, config_exists = "", False
     if target == "kimi":
         try:
@@ -99,21 +110,37 @@ def render_report(project: Path, config: Path, events: tuple[str, ...] = DEFAULT
             config_exists = True
         except (OSError, ValueError):
             existing = ""
-    already = "kimi_hook.py" in existing
-    patch = build_patch(KIMI_CONFIG, existing, snippet) if target == "kimi" else ""
+    already = bridge.name in existing
+    needs_replace = mode == "direct" and "kimi_hook.py" in existing
+    if target != "kimi":
+        patch = ""
+    elif needs_replace:
+        # 旧 service 模式已经占用同样的三个事件；追加会双推，所以出「替换」patch
+        replaced = existing.replace("kimi_hook.py", "hook_direct.py")
+        patch = "".join(difflib.unified_diff(
+            existing.splitlines(keepends=True),
+            replaced.splitlines(keepends=True),
+            fromfile=str(KIMI_CONFIG),
+            tofile=f"{KIMI_CONFIG}（替换旧桥，不追加）",
+            n=2,
+        ))
+    else:
+        patch = build_patch(KIMI_CONFIG, existing, snippet)
 
     health_ok, health_detail = C.health_check(cfg)
 
     return {
         "target": target,
+        "mode": mode,
         "project": str(project),
         "config": str(config),
         "python": python_exe,
-        "bridge": str(BRIDGE),
+        "bridge": str(bridge),
         "bridge_exists": bridge_ok,
         "config_file": str(KIMI_CONFIG) if target == "kimi" else ".claude/settings.json",
         "config_file_exists": config_exists,
         "already_configured": already,
+        "needs_replace": needs_replace,
         "hook_token_configured": bool(token),
         "hook_url": C.hook_url(cfg, with_token=False) + "?k=***",
         "health_url": f"{C.hook_base(cfg)}/health",
@@ -124,32 +151,46 @@ def render_report(project: Path, config: Path, events: tuple[str, ...] = DEFAULT
 
 
 def print_report(project: Path, config: Path, events: tuple[str, ...] = DEFAULT_EVENTS,
-                 target: str = "kimi") -> dict:
-    report = render_report(project, config, events, target)
+                 target: str = "kimi", mode: str = "direct") -> dict:
+    report = render_report(project, config, events, target, mode)
     say = C.say
     say("")
     say("=" * 72)
-    if not report["hook_token_configured"]:
+    if not report["hook_token_configured"] and mode != "direct":
         say("⚠ config.json 里没有 hook_token，服务会拒绝所有请求：先跑 python install.py")
     if not report["bridge_exists"]:
         say(f"⚠ 桥脚本不存在：{report['bridge']}（skill 包不完整？）")
-    if report["service"]["running"]:
-        say(f"✓ 本地服务在跑：{report['health_url']}")
+    if mode == "direct":
+        say("· 零常驻模式：事件来了起一个短命进程、直发微信、立刻退出")
+        say("· 不需要 hooks.py serve 常驻；Stop 等非推送事件只写 logs/hook_direct.log")
     else:
-        say(f"· 本地服务还没起（{report['service']['detail']}）—— 片段可以先配，服务记得起：")
-        say(f"    python \"{project / 'hooks.py'}\" serve --detach")
+        if report["service"]["running"]:
+            say(f"✓ 本地服务在跑：{report['health_url']}")
+        else:
+            say(f"· 本地服务还没起（{report['service']['detail']}）—— 片段可以先配，服务记得起：")
+            say(f"    python \"{project / 'hooks.py'}\" serve --detach")
 
     if target == "kimi":
         say("")
-        say(f"把下面这段追加到 {report['config_file']} 末尾（这个文件归你，本脚本不自动改）：")
+        if report["needs_replace"]:
+            say("⚠ 检测到旧 service 模式的 kimi_hook.py：**不要追加新片段**，否则同一事件会双推。")
+            say("  最省事：把 config.toml 里 3 处 command 的 kimi_hook.py 改成 hook_direct.py（见下面的替换 patch）。")
+            say("  确认不再需要常驻服务后，再 `python hooks.py stop`。")
+            say("")
+            say("下面是完整片段，仅供参考结构（事件与 timeout 不变）：")
+        else:
+            say(f"把下面这段追加到 {report['config_file']} 末尾（这个文件归你，本脚本不自动改）：")
         say("-" * 72)
         say(report["snippet"].rstrip())
         say("-" * 72)
-        if report["already_configured"]:
-            say("⚠ 这个 config.toml 里已经出现过 kimi_hook.py，别重复追加，否则同一事件会跑两遍。")
+        if report["already_configured"] and not report["needs_replace"]:
+            say(f"⚠ 这个 config.toml 里已经出现过 {Path(report['bridge']).name}，别重复追加，否则同一事件会跑两遍。")
         if report["config_file_exists"]:
             say("")
-            say("patch 预览（等价于上面那次追加；确认无误再自己动手）：")
+            if report["needs_replace"]:
+                say("替换 patch（确认无误再自己动手）：")
+            else:
+                say("patch 预览（等价于上面那次追加；确认无误再自己动手）：")
             say(report["patch"].rstrip() or "（patch 为空：内容已存在）")
         else:
             say(f"· {report['config_file']} 还不存在，新会话里 Kimi Code 会自己创建它。")
@@ -165,7 +206,7 @@ def print_report(project: Path, config: Path, events: tuple[str, ...] = DEFAULT_
     say("改完先用一条手工事件验证（不会真打扰你，除非策略判定该推）：")
     sample = json.dumps({"hook_event_name": "Stop", "session_id": "manual-test", "cwd": str(Path.cwd())},
                         ensure_ascii=False)
-    say(f"  echo '{sample}' | python \"{BRIDGE}\" --debug")
+    say(f"  echo '{sample}' | python \"{report['bridge']}\" --debug")
     say("=" * 72)
     return report
 
@@ -177,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--event", action="append", choices=list(DEFAULT_EVENTS) + ["SubagentStop"], default=None,
                         help="要接的事件，可重复；默认 Stop/PermissionRequest/Notification")
     parser.add_argument("--target", choices=("kimi", "claude"), default="kimi")
+    parser.add_argument("--mode", choices=("direct", "service"), default="direct",
+                        help="direct=零常驻直发（默认）；service=POST 到常驻服务")
     parser.add_argument("--write-patch", default=None, help="把 patch 写到这个文件，方便 git apply / 人工 review")
     args = parser.parse_args(argv)
 
@@ -189,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     config = C.config_path_for(project, args.config)
     events = tuple(args.event) if args.event else DEFAULT_EVENTS
 
-    report = print_report(project, config, events, args.target)
+    report = print_report(project, config, events, args.target, args.mode)
 
     if args.write_patch:
         path = Path(os.path.expanduser(args.write_patch))
@@ -199,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         C.say(f"[connect] patch 已写入 {path}（只是文本，没有应用）")
 
     C.emit({"status": "ok", **{k: report[k] for k in (
-        "target", "project", "config", "bridge", "bridge_exists", "config_file",
+        "target", "mode", "project", "config", "bridge", "bridge_exists", "config_file",
         "config_file_exists", "already_configured", "hook_token_configured")},
         "service_running": report["service"]["running"],
         "patch_written": bool(args.write_patch)})
