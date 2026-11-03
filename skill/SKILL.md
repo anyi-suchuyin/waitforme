@@ -161,7 +161,7 @@ python "${KIMI_SKILL_DIR}/scripts/connect_kimi.py" --mode direct    # 默认就�
 输出片段（路径是本机的）：
 
 ```toml
-# === waitforme：零常驻直发（事件来了起进程 → 发微信 → 退出）===
+# === waitforme：零常驻直发（事件来了起进程 → 推送 → 退出）===
 [[hooks]]
 event = 'Stop'
 command = '"C:\Python314\python.exe" "...\skills\waitforme\scripts\hook_direct.py"'

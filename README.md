@@ -25,7 +25,7 @@ cp -r skill ~/.kimi-code/skills/waitforme
 然后**开新会话**，说一句「安装 waitforme skill」。AI 会按 `skill/SKILL.md` 自己跑：
 体检 → 生成配置 → 问通道 key → 真发一条 → 打印 hook 片段。
 
-hook 默认走**零常驻直发**：事件来了起一个短命进程，过三道门（去重/静默/限流）后发微信，
+hook 默认走**零常驻直发**：事件来了起一个短命进程，过三道门（去重/静默/限流）后推送消息，
 发完就退出，不需要 `hooks.py serve` 一直挂着。
 
 配合 `资料/waitforme部署指南.pdf`（Skill 安装指南）一起丢给 AI 更省事。
