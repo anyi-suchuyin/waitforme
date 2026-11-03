@@ -51,10 +51,10 @@ CHANNELS: dict[str, dict[str, str]] = {
         "label": "企业微信群机器人",
         "where": "企业微信群 → 群机器人 → 添加，复制 Webhook 地址里 key= 后面那串",
     },
-    "serverchan": {
-        "field": "sckey",
-        "label": "Server酱（sct.ee）",
-        "where": "sct.ee 微信登录 → 复制 Server Key（Turbo 版才送微信）",
+    "feishu": {
+        "field": "webhook",
+        "label": "飞书自定义机器人",
+        "where": "飞书群 → 设置 → 群机器人 → 添加自定义机器人 → 复制 Webhook URL（开了签名校验再填 secret）",
     },
     "pushplus": {
         "field": "token",
@@ -62,7 +62,7 @@ CHANNELS: dict[str, dict[str, str]] = {
         "where": "www.pushplus.plus 微信扫码 → 用户中心 → 复制用户令牌",
     },
 }
-CHANNEL_ORDER = ("mock", "wecom_bot", "serverchan", "pushplus")
+CHANNEL_ORDER = ("mock", "wecom_bot", "feishu", "pushplus")
 
 
 # ---------------------------------------------------------------------------

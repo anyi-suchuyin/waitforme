@@ -2,9 +2,16 @@
   "enabled": true,
   "channel": "mock",
   "channels": {
-    "wecom_bot": {"key": ""},
-    "serverchan": {"sckey": ""},
-    "pushplus": {"token": ""}
+    "wecom_bot": {
+      "key": ""
+    },
+    "feishu": {
+      "webhook": "",
+      "secret": ""
+    },
+    "pushplus": {
+      "token": ""
+    }
   },
   "hook_token": "",
   "hook_host": "127.0.0.1",
@@ -16,7 +23,10 @@
   "min_interval_s": 180,
   "max_per_10min": 2,
   "daily_limit": 20,
-  "quiet_hours": {"start": "23:00", "end": "08:30"},
+  "quiet_hours": {
+    "start": "23:00",
+    "end": "08:30"
+  },
   "dedup_window_s": 600,
   "ask_default_deadline_s": 600
 }

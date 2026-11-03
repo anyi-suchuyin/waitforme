@@ -55,7 +55,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "channel": "mock",
     "channels": {
         "wecom_bot": {"key": ""},
-        "serverchan": {"sckey": ""},
+        "feishu": {"webhook": "", "secret": ""},
         "pushplus": {"token": ""},
     },
     "hook_token": "",

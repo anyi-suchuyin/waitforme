@@ -7,7 +7,7 @@
 用法（在 skill 目录下，或任意目录用绝对路径）：
     python install.py                       # 交互式，一步一步问
     python install.py --non-interactive --channel mock
-    python install.py --channel pushplus --key <TOKEN> --non-interactive
+    python install.py --channel feishu --key <WEBHOOK> --non-interactive
     python install.py --check               # 只体检，不写任何文件
 
 stdout 最后一行是 JSON 摘要，过程提示全走 stderr。
@@ -132,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default=None, help="waitforme 项目目录（默认自动找）")
     parser.add_argument("--config", default=None, help="config.json 路径（默认 <project>/config.json）")
     parser.add_argument("--channel", choices=list(C.CHANNEL_ORDER), default=None)
-    parser.add_argument("--key", default=None, help="通道 key（wecom_bot.key / serverchan.sckey / pushplus.token）")
+    parser.add_argument("--key", default=None, help="通道凭证（wecom_bot.key / feishu.webhook / pushplus.token）")
     parser.add_argument("--force", action="store_true", help="已存在 config.json 也覆盖（会换新 hook_token）")
     parser.add_argument("--non-interactive", action="store_true", help="不问任何问题，适合自动化")
     parser.add_argument("--check", action="store_true", help="只体检，不写任何文件")

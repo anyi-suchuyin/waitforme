@@ -11,6 +11,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -545,8 +548,17 @@ class _FakeRequests:
                 "HTTPSConnectionPool(host='qyapi.weixin.qq.com', port=443): Max retries exceeded with url: "
                 "/cgi-bin/webhook/send?key=SUPERSECRETKEY0123456789abcdef (Caused by NewConnectionError)"
             )
+        if self.mode == "leak_feishu":
+            raise self.RequestException(
+                "HTTPSConnectionPool(host='open.feishu.cn', port=443): Max retries exceeded with url: "
+                "/open-apis/bot/v2/hook/FEISHUWEBHOOK0123456789abcdef (Caused by NewConnectionError)"
+            )
         if self.mode == "remote_fail":
             return _FakeResponse(401, {"code": -1000, "message": "simulated bad key"})
+        if self.mode == "feishu_ok":
+            return _FakeResponse(200, {"code": 0, "msg": "success"})
+        if self.mode == "feishu_fail":
+            return _FakeResponse(200, {"code": 19021, "msg": "sign match fail or timestamp is not within one hour from current time"})
         return _FakeResponse(200, {"errcode": 0, "errmsg": "ok"})
 
 
@@ -578,15 +590,15 @@ def test_channels(tmp: Path) -> None:
     result = channels.send(unconfigured, "t", "b", "u")
     check("未配 key → ok:false channel_not_configured",
           result["ok"] is False and result["error"] == "channel_not_configured", str(result))
-    result = channels.send(make_cfg(tmp / "unconf2", channel="serverchan"), "t", "b", "u")
-    check("serverchan 未配 → channel_not_configured", result["error"] == "channel_not_configured", str(result))
+    result = channels.send(make_cfg(tmp / "unconf2", channel="feishu"), "t", "b", "u")
+    check("feishu 未配 → channel_not_configured", result["error"] == "channel_not_configured", str(result))
     result = channels.send(make_cfg(tmp / "unconf3", channel="pushplus"), "t", "b", "u")
     check("pushplus 未配 → channel_not_configured", result["error"] == "channel_not_configured", str(result))
     result = channels.send(make_cfg(tmp / "unknown", channel="telegram"), "t", "b", "u")
     check("未知通道 → ok:false 不抛", result["ok"] is False and result["error"] == "unknown_channel", str(result))
     _stub_net("remote_fail")
-    result = channels.send(make_cfg(tmp / "netfail", channel="serverchan", channels={"serverchan": {"sckey": "test-sckey"}}), "t", "b", "u")
-    check("远端非成功码 → ok:false，不抛", result["ok"] is False and result["channel"] == "serverchan" and "http_401" in (result["error"] or ""), str(result))
+    result = channels.send(make_cfg(tmp / "netfail", channel="feishu", channels={"feishu": {"webhook": "test-webhook"}}), "t", "b", "u")
+    check("远端非成功码 → ok:false，不抛", result["ok"] is False and result["channel"] == "feishu" and "http_401" in (result["error"] or ""), str(result))
     _stub_net("timeout")
     result = channels.send(make_cfg(tmp / "neterr", channel="wecom_bot", channels={"wecom_bot": {"key": "test-key"}}), "t", "b", "u")
     check("网络超时折成 ok:false network_error", result["ok"] is False and "network_error" in (result["error"] or ""), str(result))
@@ -606,19 +618,29 @@ def test_channels(tmp: Path) -> None:
     policy.settle_push(leaky_cfg, rid, False, channel="wecom_bot", error=result["error"])
     disk = policy.push_log_path(leaky_cfg).read_text(encoding="utf-8")
     check("写进 push_log 的 error 同样是脱敏过的", "SUPERSECRETKEY0123456789abcdef" not in disk, disk[:200])
-    _stub_net("timeout")
-    result = channels.send(make_cfg(tmp / "tmo", channel="serverchan", channels={"serverchan": {"sckey": "SCT0123456789abcdefghij"}}), "t", "b", "u")
-    check("ServerChan 异常不泄露 SCKEY", "SCT0123456789abcdefghij" not in json.dumps(result), str(result["error"]))
+    _stub_net("leak_feishu")
+    result = channels.send(make_cfg(tmp / "leakfs", channel="feishu",
+                                    channels={"feishu": {"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/FEISHUWEBHOOK0123456789abcdef"}}),
+                           "t", "b", "http://u")
+    check("飞书异常也折成 ok:false", result["ok"] is False and result["error"].startswith("network_error"), str(result))
+    check("飞书 webhook token 不进 error", "FEISHUWEBHOOK0123456789abcdef" not in json.dumps(result), str(result["error"]))
+    check("飞书 error 保留主机名", "open.feishu.cn" in result["error"], str(result["error"]))
     _restore_net()
 
     # === W13 回归：分通道标题上限；所有网络调用 timeout=10 ===
     _stub_net("ok")
     long_title = "⏳ 要你拍板：billing 历史数据到底要不要动，这一句已经很长了" + "尾巴" * 6
-    sc_cfg = make_cfg(tmp / "title_sc", channel="serverchan", channels={"serverchan": {"sckey": "test-sckey"}})
-    channels.send(sc_cfg, long_title, "b", "http://u")
-    sent_title = channels.requests.calls[-1]["data"]["title"]  # type: ignore[attr-defined]
-    check("serverchan 标题被压到 32 字内", len(sent_title) <= 32, f"{len(sent_title)} 字：{sent_title}")
-    check("serverchan 标题截断带省略号", sent_title.endswith("…"), sent_title)
+    fs_cfg = make_cfg(tmp / "title_fs", channel="feishu", channels={"feishu": {"webhook": "test-webhook"}})
+    channels.send(fs_cfg, long_title + "拖" * 40, "b", "http://u")
+    fs_payload = channels.requests.calls[-1]["json"]  # type: ignore[attr-defined]
+    fs_title = fs_payload["content"]["post"]["zh_cn"]["title"]
+    check("feishu 标题被压到 64 字内", len(fs_title) <= 64, f"{len(fs_title)} 字：{fs_title}")
+    check("feishu 标题截断带省略号", fs_title.endswith("…"), fs_title)
+    check("feishu 用 post 富文本", fs_payload.get("msg_type") == "post", str(fs_payload)[:200])
+    fs_paragraphs = fs_payload["content"]["post"]["zh_cn"]["content"]
+    fs_links = [el for para in fs_paragraphs for el in para if el.get("tag") == "a"]
+    check("feishu 链接区带 href", bool(fs_links) and fs_links[-1].get("href") == "http://u", str(fs_links)[:200])
+    check("feishu 走官方 webhook 地址", "open.feishu.cn/open-apis/bot/v2/hook/test-webhook" in channels.requests.calls[-1]["url"], channels.requests.calls[-1]["url"])  # type: ignore[attr-defined]
     pp_cfg = make_cfg(tmp / "title_pp", channel="pushplus", channels={"pushplus": {"token": "test-token"}})
     channels.send(pp_cfg, long_title, "b", "http://u")
     check("pushplus 标题上限 100 字", len(channels.requests.calls[-1]["json"]["title"]) <= 100, str(len(long_title)))  # type: ignore[attr-defined]
@@ -628,6 +650,16 @@ def test_channels(tmp: Path) -> None:
     check("企微标题按 40 字上限收敛", len(content_sent.splitlines()[0]) <= 44, content_sent.splitlines()[0])
     check("所有通道调用 timeout=10", all(c["timeout"] == channels.NET_TIMEOUT_S for c in channels.requests.calls), str([c["timeout"] for c in channels.requests.calls]))  # type: ignore[attr-defined]
     check("企微 key 走 params 不进 URL 字符串", "key" not in channels.requests.calls[-1]["url"], channels.requests.calls[-1]["url"])  # type: ignore[attr-defined]
+    sec_cfg = make_cfg(tmp / "title_fs_sec", channel="feishu",
+                       channels={"feishu": {"webhook": "test-webhook", "secret": "SIGN_SECRET"}})
+    channels.send(sec_cfg, "t", "b", "http://u")
+    sec_payload = channels.requests.calls[-1]["json"]  # type: ignore[attr-defined]
+    check("feishu 配了 secret 会带 timestamp/sign",
+          "timestamp" in sec_payload and "sign" in sec_payload, str(sec_payload)[:160])
+    expect = base64.b64encode(
+        hmac.new((sec_payload["timestamp"] + "\nSIGN_SECRET").encode(), b"", hashlib.sha256).digest()
+    ).decode()
+    check("feishu 签名按官方算法生成", sec_payload.get("sign") == expect, str(sec_payload.get("sign")))
     _restore_net()
     check("resolve_channel 覆盖优先", channels.resolve_channel({"channel": "wecom_bot"}, "mock") == "mock")
     check("resolve_channel 没配当 mock", channels.resolve_channel({"channel": ""}, None) == "mock")
@@ -1037,7 +1069,7 @@ def test_cli(tmp: Path) -> None:
     check("ask --wait 超时 → timeout 退出 2", proc.returncode == 2 and out["status"] == "timeout", f"code={proc.returncode} {proc.stdout[:200]}")
     check("timeout 带 default_applied", out.get("default_applied") == "A", str(out))
 
-    code, out, err = run_cli(tmp, ["send", "--title", "x", "--channel", "serverchan"])
+    code, out, err = run_cli(tmp, ["send", "--title", "x", "--channel", "feishu"])
     check("send 通道未配置 → 退出 2", code == 2 and json.loads(out)["status"] == "failed", f"code={code} {out[:200]}")
     code, out, err = run_cli(tmp, ["send", "--title", "x", "--channel", "mock"])
     check("send mock → 退出 0", code == 0 and json.loads(out)["status"] == "sent", f"code={code} {out[:200]}")
@@ -1140,7 +1172,7 @@ def test_live() -> None:
     if channel == "mock":
         print("  SKIP  当前通道是 mock，没有真实推送（改 config.json 的 channel 后再 --live）")
         return
-    key_fields = {"wecom_bot": ("wecom_bot", "key"), "serverchan": ("serverchan", "sckey"), "pushplus": ("pushplus", "token")}
+    key_fields = {"wecom_bot": ("wecom_bot", "key"), "feishu": ("feishu", "webhook"), "pushplus": ("pushplus", "token")}
     name, field = key_fields[channel]
     if not str((cfg.get("channels") or {}).get(name, {}).get(field) or "").strip():
         print(f"  SKIP  通道 {channel} 未配置 {field}，不真发")

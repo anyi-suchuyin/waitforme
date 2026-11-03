@@ -105,7 +105,7 @@ python "$HOME/.kimi-code/skills/waitforme/scripts/verify.py" --service   # 含 2
 | 通道 | 怎么拿 key | 填哪儿 |
 |---|---|---|
 | `wecom_bot` | 企业微信群 → 群机器人 → 添加，复制 Webhook 地址里 `key=` 后面那串 | `channels.wecom_bot.key` |
-| `serverchan` | sct.ee 微信登录 → 「Server Key」那一串（Turbo 加送） | `channels.serverchan.sckey` |
+| `feishu` | 飞书群 → 设置 → 群机器人 → 添加自定义机器人 → 复制 Webhook URL（开了签名校验再填 `secret`） | `channels.feishu.webhook` |
 | `pushplus` | www.pushplus.plus 微信扫码 → 用户中心里的「用户令牌」 | `channels.pushplus.token` |
 
 `mock` 不联网，把最终消息写进 `logs/mock_sent.jsonl`，用来看排版、跑自测。
@@ -118,7 +118,7 @@ python "$HOME/.kimi-code/skills/waitforme/scripts/verify.py" --service   # 含 2
 ```
 python waitforme.py init [--force]
 python waitforme.py link
-python waitforme.py send --title T [--body MD] [--urgency normal|high] [--dry-run] [--channel mock|wecom_bot|serverchan|pushplus]
+python waitforme.py send --title T [--body MD] [--urgency normal|high] [--dry-run] [--channel mock|wecom_bot|feishu|pushplus]
 python waitforme.py ask  --payload q.json [--wait] [--deadline-s N] [--dry-run] [--channel ...]
 python waitforme.py test [--mock] [--live]
 python waitforme.py status

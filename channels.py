@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -31,12 +34,12 @@ HERE = Path(__file__).resolve().parent
 NET_TIMEOUT_S = 10
 CLOSER = "[👉 点击打开会话继续对话]({url})"
 NO_LINK_NOTE = "> 本次没有可用跳转链接，请回到电脑前操作"
-VALID_CHANNELS = ("mock", "wecom_bot", "serverchan", "pushplus")
+VALID_CHANNELS = ("mock", "wecom_bot", "feishu", "pushplus")
 
-# 分通道上限：企微 markdown 正文 4096 字节（留余量），ServerChan 标题实测超 32 字直接拒收
+# 分通道上限：企微 markdown 正文 4096 字节（留余量）；飞书 post 标题按 64 字收敛
 CHANNEL_LIMITS: dict[str, dict[str, int]] = {
     "wecom_bot": {"max_bytes": 4000, "title_chars": 40},
-    "serverchan": {"max_bytes": 30000, "title_chars": 32},
+    "feishu": {"max_bytes": 30000, "title_chars": 64},
     "pushplus": {"max_bytes": 30000, "title_chars": 100},
     # mock 与企微对齐，`test` 里看到的排版就是真发出去的样子
     "mock": {"max_bytes": 4000, "title_chars": 40},
@@ -46,6 +49,7 @@ CHANNEL_LIMITS: dict[str, dict[str, int]] = {
 _CONTENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}"), "sk-***"),
     (re.compile(r"(?i)([?&](?:key|token|sckey|secret|password|passwd|api[_-]?key)=)[^&\s\"']+"), r"\1***"),
+    (re.compile(r"(?i)(/open-apis/bot/v2/hook/)[A-Za-z0-9\-]+"), r"\1***"),
     (re.compile(r"(?i)(://[^/\s:@]+:)[^/\s@]+(@)"), r"\1***\2"),
     (re.compile(r"\b[A-Za-z0-9][A-Za-z0-9_\-]{30,}\b"), "***"),
 ]
@@ -109,7 +113,7 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
 
 
 def clip_title(title: str, max_chars: int) -> str:
-    """按通道上限截标题（ServerChan 超 32 字会整条被拒）。"""
+    """按通道上限截标题（各通道对标题长度要求不同）。"""
     text = (title or "").strip()
     if max_chars <= 0 or len(text) <= max_chars:
         return text
@@ -208,8 +212,8 @@ def send(cfg: dict[str, Any], title: str, body_md: str, url: str, urgency: str =
             return _send_mock(cfg, t_title, content, url, urgency)
         if name == "wecom_bot":
             return _send_wecom(cfg, content)
-        if name == "serverchan":
-            return _send_serverchan(cfg, t_title, content)
+        if name == "feishu":
+            return _send_feishu(cfg, t_title, body_md, url, urgency)
         if name == "pushplus":
             return _send_pushplus(cfg, t_title, content)
         return _result(False, name, 0, "unknown_channel")
@@ -251,16 +255,54 @@ def _send_wecom(cfg: dict[str, Any], content: str) -> dict[str, Any]:
     return _judge(resp, "wecom_bot")
 
 
-def _send_serverchan(cfg: dict[str, Any], title: str, content: str) -> dict[str, Any]:
-    sckey = str(_channel_cfg(cfg, "serverchan").get("sckey") or "").strip()
-    if not sckey:
-        return _result(False, "serverchan", 0, "channel_not_configured")
-    resp = requests.post(
-        f"https://sctapi.ftqq.com/{sckey}.send",
-        data={"title": title, "desp": content},
-        timeout=NET_TIMEOUT_S,
-    )
-    return _judge(resp, "serverchan")
+def _send_feishu(cfg: dict[str, Any], title: str, body_md: str, url: str,
+                 urgency: str) -> dict[str, Any]:
+    """飞书自定义机器人：post 富文本（标题 + 正文段落 + 链接），支持可选签名校验。
+
+    配置二选一：
+      {"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/<token>"}
+      {"webhook": "<token>"}    # 只填 token 时自动拼官方地址
+    开了「签名校验」的机器人再填 "secret"，否则飞书会拒收（code=19021）。
+    """
+    conf = _channel_cfg(cfg, "feishu")
+    webhook = str(conf.get("webhook") or conf.get("key") or "").strip()
+    if not webhook:
+        return _result(False, "feishu", 0, "channel_not_configured")
+    if webhook.startswith(("http://", "https://")):
+        hook_url = webhook
+    else:
+        hook_url = f"https://open.feishu.cn/open-apis/bot/v2/hook/{webhook}"
+
+    mark = "🔴 " if str(urgency).lower() == "high" else ""
+    safe_title = clip_title(f"{mark}{title}", 64) or "Kimi 需要你"
+    body = redact_secrets((body_md or "").strip())
+    body = _truncate_utf8(body, 28000)  # 给 post 结构与链接留余量
+
+    paragraphs: list[list[dict[str, Any]]] = []
+    for line in body.splitlines():
+        if line.strip():
+            paragraphs.append([{"tag": "text", "text": line.strip()}])
+    if not paragraphs:
+        paragraphs.append([{"tag": "text", "text": "Kimi 需要你"}])
+    if url:
+        paragraphs.append([{"tag": "a", "text": "👉 点开继续", "href": url}])
+    else:
+        paragraphs.append([{"tag": "text", "text": "本次没有可用跳转链接，请回到电脑前操作"}])
+
+    payload: dict[str, Any] = {
+        "msg_type": "post",
+        "content": {"post": {"zh_cn": {"title": safe_title, "content": paragraphs}}},
+    }
+    secret = str(conf.get("secret") or "").strip()
+    if secret:
+        ts = str(int(time.time()))
+        string_to_sign = ts + "\n" + secret
+        digest = hmac.new(string_to_sign.encode("utf-8"), b"", digestmod=hashlib.sha256).digest()
+        payload["timestamp"] = ts
+        payload["sign"] = base64.b64encode(digest).decode("ascii")
+
+    resp = requests.post(hook_url, json=payload, timeout=NET_TIMEOUT_S)
+    return _judge(resp, "feishu")
 
 
 def _send_pushplus(cfg: dict[str, Any], title: str, content: str) -> dict[str, Any]:
@@ -295,7 +337,7 @@ def _biz_ok(resp: "requests.Response") -> bool:
 def _biz_error(resp: "requests.Response", code: int) -> str:
     data = _safe_json(resp)
     if data:
-        msg = data.get("message") or data.get("errmsg") or data.get("error") or ""
+        msg = data.get("message") or data.get("errmsg") or data.get("msg") or data.get("error") or ""
         return f"http_{code}:{_redact_error(msg)}"
     return f"http_{code}:{_redact_error(resp.text)}"
 

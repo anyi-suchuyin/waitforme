@@ -88,7 +88,7 @@ python "${KIMI_SKILL_DIR}/scripts/verify.py" --service
 |---|---|
 | `--project PATH` | 指定项目目录（默认自动找） |
 | `--config PATH` | 指定 config.json（默认 `<project>/config.json`，也认 `WAITFORME_CONFIG`） |
-| `--channel mock\|wecom_bot\|serverchan\|pushplus` | 通道；非交互默认 mock |
+| `--channel mock\|wecom_bot\|feishu\|pushplus` | 通道；非交互默认 mock |
 | `--key KEY` | 通道 key（mock 不需要） |
 | `--force` | 已有 config 也覆盖（**会换 hook_token**） |
 | `--non-interactive` | 一句话都不问；已有 config 时默认保留，除非加 `--force` |
@@ -111,7 +111,7 @@ python "${KIMI_SKILL_DIR}/scripts/configure.py"
 | 通道 | key 去哪拿 | 落到 config 的哪 |
 |---|---|---|
 | `wecom_bot` | 企业微信群 → 群机器人 → 添加，Webhook 里 `key=` 后面那串 | `channels.wecom_bot.key` |
-| `serverchan` | sct.ee 微信登录 → Server Key（Turbo 版才送微信） | `channels.serverchan.sckey` |
+| `feishu` | 飞书群 → 设置 → 群机器人 → 添加自定义机器人 → 复制 Webhook URL；开了签名校验再填 `channels.feishu.secret` | `channels.feishu.webhook` |
 | `pushplus` | www.pushplus.plus 微信扫码 → 用户中心 → 用户令牌 | `channels.pushplus.token` |
 | `mock` | 不需要 | — |
 
