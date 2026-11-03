@@ -134,17 +134,25 @@ python "${KIMI_SKILL_DIR}/scripts/verify.py" --live
 
 ### 4a. 零常驻直发（默认，推荐）
 
-`hook_direct.py`：读 stdin → 直接调 `waitforme.py send`（短命进程）→ 退出。
-**完全不碰 8790**，不需要常驻服务。6 条硬约束：
+`hook_direct.py`：读 stdin → **在进程内过 `policy.gate`** → 通过后 `channels.send` → 退出。
+**完全不碰 8790**，不需要常驻服务。三道门原样生效：
+
+`事件类型 → 内容去重(dedup_window_s) → 静默时段 → 同类间隔(min_interval_s) → 10 分钟上限 → 当日上限`
+
+放行时才预占额度；发送失败会退还（`settle_push`）。6 条硬约束：
 
 | # | 约束 | 实现 |
 |---|---|---|
 | 1 | 事件名取 `hook_event_name`，容错 `event`/`type`，大小写与 `-`/`_` 归一 | `normalize_event()` |
-| 2 | 不碰 8790 服务，直接走 `waitforme.py send` | `run_send()` |
+| 2 | 不碰 8790 服务 | 进程内 `policy.gate` + `channels.send` |
 | 3 | **恒 exit 0**（Stop 是可阻断事件） | 顶层 `BaseException` 兜底 |
-| 4 | **stdout 必须为空**，调试只走 `--debug` + stderr | 子进程 stdout=DEVNULL |
-| 5 | 自控超时（hook timeout=10 → 内部 8s），超时也 exit 0 | `--timeout` / `WAITFORME_HOOK_TIMEOUT` |
-| 6 | PermissionRequest / Notification → 推；Stop 及其它 → 只写 `logs/hook_direct.log` | `PUSH_EVENTS` |
+| 4 | **stdout 必须为空**，调试只走 `--debug` + stderr | 不向 stdout 写任何内容 |
+| 5 | 自控超时（hook timeout=10 → 网络 8s），超时也 exit 0 | `--timeout` / `WAITFORME_HOOK_TIMEOUT` |
+| 6 | PermissionRequest / Notification → 过闸后推；Stop 及其它 → 只写 `logs/hook_direct.log` | `PUSH_EVENTS` |
+
+**默认 `urgency=normal`**：静默时段、20 条/日、2 条/10 分钟、180s 同类间隔全部生效。
+确实要突破静默（例如急事），显式加 `--urgency high` 或环境变量 `WAITFORME_HOOK_URGENCY=high`；
+high 会跳过静默与同类间隔，但仍有 5 条/10 分钟、50 条/日的硬上限。
 
 ```bash
 python "${KIMI_SKILL_DIR}/scripts/connect_kimi.py" --mode direct    # 默认就是 direct
