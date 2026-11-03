@@ -185,8 +185,8 @@ def test_markdown() -> None:
 
     content = channels.build_content("⏳ 要你拍板：billing 历史数据动不动", body, "http://x.example/rc", "normal")
     check("完整消息含标题", content.startswith("### ⏳ 要你拍板：billing 历史数据动不动"), content[:60])
-    check("完整消息含链接", "[👉 在系统浏览器打开](http://x.example/rc)" in content)
-    check("消息含复制到系统浏览器的提示", "内置浏览器打不开" in content and "http://x.example/rc" in content)
+    check("完整消息含链接", "[👉 在浏览器打开](http://x.example/rc)" in content)
+    check("消息含复制到系统浏览器的提示", "打不开就点右上角" in content and "http://x.example/rc" in content)
     check("完整消息含选项", "稳妥重构" in content)
     check("high 标题加红点", channels.build_content("t", "b", "u", "high").startswith("### 🔴"))
     no_url = channels.build_content("t", "b", "", "normal")
@@ -668,6 +668,33 @@ def test_channels(tmp: Path) -> None:
           channels.resolve_channel({"channel": "telegram"}, None) == "telegram")
 
 
+def test_event_format() -> None:
+    section("事件文案（一眼可决策）")
+    done = {
+        "message": "Wall time: 162.993 seconds melt 渲染新 project.mlt 到 _mlt_s6_fix.mp4 completed.",
+        "notification_type": "task.completed", "cwd": "D:/anyi", "session_id": "session_abc",
+    }
+    title, body = hooks_module.format_event_message(done, "Notification")
+    check("完成通知标题提炼产物", title.startswith("✅") and "_mlt_s6_fix.mp4" in title, title)
+    check("完成通知含耗时与结果", "2 分 43 秒" in body and "→" in body, body)
+    check("完成通知明确无需操作", "无需操作" in body, body)
+    check("完成通知不再出现原始噪音", "Wall time" not in body and "task.completed" not in body, body)
+
+    perm = {
+        "message": "Kimi 请求执行一条命令，等你批准", "tool_name": "Bash",
+        "tool_command": "npm run build", "cwd": "D:/anyi/billing", "session_id": "abcd1234ef56",
+    }
+    ptitle, pbody = hooks_module.format_event_message(perm, "PermissionRequest")
+    check("授权标题带工具与命令", ptitle.startswith("⚠️") and "Bash" in ptitle and "npm run build" in ptitle, ptitle)
+    check("授权正文给出明确动作", "回「批准」或「拒绝」" in pbody, pbody)
+    check("授权正文含项目与会话", "billing" in pbody and "abcd1234" in pbody, pbody)
+
+    failed = {"message": "编译失败：TypeError in build.py", "notification_type": "task.failed"}
+    ftitle, fbody = hooks_module.format_event_message(failed, "Notification")
+    check("失败通知标题带❌", ftitle.startswith("❌"), ftitle)
+    check("失败通知给重试动作", "重试" in fbody, fbody)
+
+
 # ---------------------------------------------------------------------------
 # 6. hooks 服务端到端
 # ---------------------------------------------------------------------------
@@ -792,8 +819,10 @@ def test_hooks(tmp: Path) -> None:
         got = len(read_mock(cfg))
         check(f"新增 mock 条数 = 期望推送数 {expected}", got == baseline + expected, f"got={got} baseline={baseline} expected={expected}")
         records = read_mock(cfg)
-        check("推送标题是「Kimi 需要你」", all("Kimi 需要你" in r["title"] for r in records), str(records[:1]))
-        check("推送标题带事件中文名", all(("等你授权" in r["title"]) or ("有新通知" in r["title"]) or ("回合结束" in r["title"]) for r in records), str([r["title"] for r in records]))
+        check("推送标题一眼能看出状态", all(r["title"].startswith(("⚠️", "🔔", "✅", "❌")) for r in records), str([r["title"] for r in records]))
+        check("推送正文含「要你做/无需操作」的决策提示",
+              all(("要你做" in r["content"]) or ("无需操作" in r["content"]) or ("回「批准」" in r["content"]) for r in records),
+              str([r["content"][:80] for r in records]))
         check("推送正文含项目目录名", any("billing" in r["content"] for r in records))
         check("推送正文含会话短 id", any("abcd1234" in r["content"] for r in records))
         check("推送正文含消息截断", any("npm run build" in r["content"] for r in records))
@@ -1200,6 +1229,7 @@ def main() -> int:
         test_linker(tmp / "linker")
         test_policy(tmp / "policy")
         test_channels(tmp / "channels")
+        test_event_format()
         test_concurrent_append(tmp / "conc")
         test_hooks(tmp / "hooks")
         test_cli(tmp / "cli")

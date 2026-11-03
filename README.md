@@ -187,6 +187,32 @@ selftest.py        272 项离线断言 + 可选 --live
 | `run/hooks.pid` | 后台服务 pid |
 | `inbox/<id>.answer.json` | `ask --wait` 的答案落地处 |
 
+## 推送长什么样
+
+标题就是结论，正文三层：状态 → 结果/命令 → 要你做什么。
+
+```
+✅ 完成：_mlt_s6_fix.mp4
+✅ 任务完成（耗时 2 分 43 秒）
+结果：project.mlt → _mlt_s6_fix.mp4
+
+无需操作；想继续就点开回一句
+
+项目：anyi ｜ 会话：session_
+```
+
+```
+⚠️ 待批：Bash npm run build
+⚠️ 需要你批准
+Bash：npm run build
+
+回「批准」或「拒绝」即可
+
+项目：billing ｜ 会话：abcd1234
+```
+
+微信/企业微信内置浏览器打不开 Kimi 远程页，消息里附了一条纯文本链接，长按复制到系统浏览器即可。
+
 ## 已知限制
 
 - **hook payload 的字段没有公开契约**。所以服务是「宽容解析」：递归按候选键名

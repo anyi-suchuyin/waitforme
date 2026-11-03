@@ -290,24 +290,133 @@ def truncate(text: Any, limit: int = 300) -> str:
     return flat[:limit] + "…" if len(flat) > limit else flat
 
 
-def build_event_body(found: dict[str, Any], event_name: str) -> str:
-    """推送正文：会话线索（目录名 + 短 id）+ 事件说明 + 消息截断。"""
+_DURATION_RE = re.compile(r"(?i)wall\s*time\s*[:：]\s*([\d.]+)\s*(?:seconds?|secs?|s)")
+_DURATION_ZH_RE = re.compile(r"耗时\s*([\d.]+)\s*秒")
+_MAP_RE = re.compile(r"([\w\-.]+\.[A-Za-z0-9]{2,6})\s*(?:到|to|->|→)\s*([\w\-.]+\.[A-Za-z0-9]{2,6})")
+_NOISE_RE = re.compile(r"(?i)(task\.)?(completed|done|success)\.?|类型\s*[:：]\s*\S+")
+
+
+def fmt_duration(seconds: float) -> str:
+    total = int(round(float(seconds)))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {sec} 秒" if sec else f"{minutes} 分钟"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分"
+
+
+def extract_duration(text: str) -> str:
+    match = _DURATION_RE.search(text or "") or _DURATION_ZH_RE.search(text or "")
+    if not match:
+        return ""
+    try:
+        return fmt_duration(float(match.group(1)))
+    except ValueError:
+        return ""
+
+
+def extract_artifact(text: str) -> tuple[str, str]:
+    """从消息里找「A 到 B」的文件映射；找不到就退而求其次取最后一个像产物的文件名。"""
+    match = _MAP_RE.search(text or "")
+    if match:
+        return match.group(1), match.group(2)
+    files = re.findall(r"[\w\-.]+\.(?:mp4|mkv|mlt|md|json|py|js|ts|tsx|png|jpe?g|pdf|zip|txt|log)",
+                       text or "", re.I)
+    return (files[-1], "") if files else ("", "")
+
+
+def clean_summary(text: str) -> str:
+    """去掉耗时、类型、completed 这类噪音，只留人能读的一句话。"""
+    cleaned = _DURATION_RE.sub("", text or "")
+    cleaned = _DURATION_ZH_RE.sub("", cleaned)
+    cleaned = _NOISE_RE.sub("", cleaned)
+    return " ".join(cleaned.split()).strip(" .。;；,，")
+
+
+def classify_status(event_name: str, text: str, notification_type: str) -> str:
+    blob = f"{notification_type} {text}".lower()
+    if event_name == "PermissionRequest":
+        return "needs_approval"
+    if re.search(r"fail|error|失败|异常|超时", blob):
+        return "failed"
+    if re.search(r"complet|done|success|完成|已生成|渲染好", blob):
+        return "completed"
+    if re.search(r"wait|pending|approval|needs|等你|审批|确认", blob):
+        return "waiting"
+    return "info"
+
+
+def format_event_message(found: dict[str, Any], event_name: str) -> tuple[str, str]:
+    """把「事件 + payload」压成一眼能决策的标题与正文。
+
+    固定三层：**发生了什么（状态）→ 结果/命令 → 要你做什么**，最后才是项目/会话。
+    """
+    message = str(found.get("last_assistant_message") or found.get("message") or "").strip()
+    tool = str(found.get("tool_name") or "").strip()
+    command = str(found.get("tool_command") or "").strip()
+    notification_type = str(found.get("notification_type") or "").strip()
+    duration = extract_duration(message)
+    src, dst = extract_artifact(message)
+    status = classify_status(event_name, message, notification_type)
+
     cwd = str(found.get("cwd") or "").strip()
     cwd_name = Path(cwd).name if cwd else "?"
-    message = found.get("last_assistant_message") or found.get("message") or ""
-    lines = [
-        f"> 项目：{cwd_name}",
-        f"> 会话：{short_session(found.get('session_id'))}",
-        f"> 事件：{EVENT_ZH.get(event_name, event_name)}",
-    ]
-    if message:
-        lines.append("")
-        lines.append(f"「{truncate(message)}」")
-    if found.get("notification_type"):
-        lines.append(f"> 通知类型：{found['notification_type']}")
-    lines.append("")
-    lines.append("手机点下面的链接，回一句话就行。")
-    return "\n".join(lines)
+    session = short_session(found.get("session_id"))
+
+    if event_name == "PermissionRequest":
+        action = truncate(command or message, 120) or "Kimi 请求执行一个操作"
+        title = f"⚠️ 待批：{tool or '操作'}" + (f" {truncate(command, 18)}" if command else "")
+        lines = [
+            "⚠️ 需要你批准",
+            f"{tool or '操作'}：{action}",
+            "",
+            "回「批准」或「拒绝」即可（也可以直接说你的决定）",
+        ]
+    elif status == "completed":
+        result = f"{src} → {dst}" if dst else (clean_summary(message) or "任务完成")
+        title = f"✅ 完成：{truncate(dst or clean_summary(message) or '任务完成', 18)}"
+        lines = [
+            "✅ 任务完成" + (f"（耗时 {duration}）" if duration else ""),
+            f"结果：{truncate(result, 100)}",
+            "",
+            "无需操作；想继续就点开回一句",
+        ]
+    elif status == "failed":
+        reason = clean_summary(message) or "见日志"
+        title = f"❌ 失败：{truncate(reason, 18)}"
+        lines = [
+            "❌ 任务失败",
+            f"原因：{truncate(reason, 120)}",
+            "",
+            "点开链接看详情，或回一句重试",
+        ]
+    elif event_name == "Stop":
+        title = "✅ 回合结束"
+        lines = [
+            "✅ 回合结束",
+            f"最后一句：{truncate(message, 100)}" if message else "Kimi 停了，可能在等你",
+            "",
+            "要你做：看一眼，需要的话回一句",
+        ]
+    else:
+        summary = clean_summary(message) or notification_type or "Kimi 发来一条通知"
+        title = f"🔔 通知：{truncate(summary, 18)}"
+        lines = [
+            "🔔 Kimi 发来通知",
+            f"内容：{truncate(summary, 120)}",
+            "",
+            "要你做：看一眼，需要的话回一句",
+        ]
+
+    lines += ["", f"项目：{cwd_name} ｜ 会话：{session}"]
+    return title, "\n".join(lines)
+
+
+def build_event_body(found: dict[str, Any], event_name: str) -> str:
+    """兼容旧调用：只取正文。"""
+    return format_event_message(found, event_name)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +430,7 @@ def do_push(cfg: dict[str, Any], found: dict[str, Any], event_name: str, reason:
     try:
         import waitforme
 
-        title = f"⏳ Kimi 需要你：{EVENT_ZH.get(event_name, event_name)}"
-        body = build_event_body(found, event_name)
+        title, body = format_event_message(found, event_name)
         result = waitforme.push_message(cfg, kind=event_name, title=title, body_md=body,
                                         urgency=urgency, fingerprint_value=found.get("_fp"),
                                         reserve_id=reserve_id)
@@ -372,8 +480,7 @@ def handle_hook(raw_body: bytes, query: dict[str, list[str]], cfg: dict[str, Any
     found = extract_fields(parsed) if parsed is not None else {}
     event_name = decide_event_name(found, query)
     urgency = str(top_level_value(parsed, ("urgency", "priority")) or "normal").strip().lower()
-    title = f"⏳ Kimi 需要你：{EVENT_ZH.get(event_name, event_name)}"
-    body = build_event_body(found, event_name)
+    title, body = format_event_message(found, event_name)
 
     found["_fp"] = policy.fingerprint(title, body)
     event = dict(found)

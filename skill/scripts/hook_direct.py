@@ -166,50 +166,22 @@ def pick(pairs: list[tuple[str, object]], names: tuple[str, ...]) -> str:
 
 
 def build_message(event: str, data: dict) -> tuple[str, str]:
-    """返回 (标题后缀, 正文)：正文要讲清「卡在哪」和「要你决定什么」。"""
+    """交给项目里的 hooks.format_event_message 统一排版（状态/结果/要你做什么）。"""
     pairs = gather_pairs(data)
-    message = pick(pairs, ("message", "msg", "text", "content", "body"))
-    last_message = pick(pairs, ("last_assistant_message", "lastassistantmessage",
-                                "assistant_message", "response"))
-    tool = pick(pairs, ("tool_name", "toolname", "tool"))
-    command = pick(pairs, ("command", "cmd", "script", "shell_command", "bash_command"))
-    if not command:
-        command = pick(pairs, ("tool_input", "toolinput", "input", "arguments", "args",
-                               "parameters", "request", "permission"))
-    notification_type = pick(pairs, ("notification_type", "notificationtype"))
-    cwd = pick(pairs, ("cwd", "working_dir", "workingdir", "project_path", "workdir"))
-    session = pick(pairs, ("session_id", "sessionid", "session", "conversation_id"))
-
-    summary = message or last_message
-    if event == "PermissionRequest":
-        label = tool or ("命令" if command else "")
-        title = f"等你授权：{label}" if label else "等你授权"
-        what = summary or (f"请求执行 {tool or '一个操作'}" if tool else "Kimi 请求执行一个操作")
-        lines = [f"Kimi 卡在这里：{short(what, 120)}"]
-        if command:
-            lines.append(f"命令：{short(command, 160)}")
-        lines += ["", "要你决定：批准还是拒绝？（回「批准」或「拒绝」，也可以直接说你的决定）"]
-    elif event == "Notification":
-        label = short(summary or notification_type, 16)
-        title = f"有新通知：{label}" if label else "有新通知"
-        what = summary or "Kimi 发来一条通知"
-        lines = [f"Kimi 发来通知：{short(what, 140)}"]
-        if notification_type:
-            lines.append(f"类型：{notification_type}")
-        lines += ["", "要你决定：看一眼，需要的话回一句。"]
-    else:
-        title = EVENT_TITLE.get(event, event)
-        what = summary or "Kimi 有一个动作需要你确认"
-        lines = [f"Kimi 卡在这里：{short(what, 140)}", "", "要你决定：看一眼，需要的话回一句。"]
-
-    details: list[str] = []
-    if cwd:
-        details.append(f"目录：{Path(cwd).name or cwd}")
-    if session:
-        details.append(f"会话：{session[:8]}")
-    if details:
-        lines += ["", " / ".join(details)]
-    return title, "\n".join(lines)
+    found = {
+        "message": pick(pairs, ("message", "msg", "text", "content", "body")),
+        "last_assistant_message": pick(pairs, ("last_assistant_message", "lastassistantmessage",
+                                               "assistant_message", "response")),
+        "tool_name": pick(pairs, ("tool_name", "toolname", "tool")),
+        "tool_command": pick(pairs, ("command", "cmd", "script", "shell_command", "bash_command",
+                                     "tool_input", "toolinput", "input", "arguments", "args",
+                                     "parameters", "request", "permission")),
+        "notification_type": pick(pairs, ("notification_type", "notificationtype")),
+        "cwd": pick(pairs, ("cwd", "working_dir", "workingdir", "project_path", "workdir")),
+        "session_id": pick(pairs, ("session_id", "sessionid", "session", "conversation_id")),
+    }
+    import hooks as core  # 项目目录已在 sys.path 里
+    return core.format_event_message(found, event)
 
 
 def push_with_gates(cfg: dict, event: str, title: str, body: str, urgency: str,
@@ -329,8 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     if str(project) not in sys.path:
         sys.path.insert(0, str(project))
 
-    title_suffix, body = build_message(event, payload)
-    title = f"⏳ Kimi 需要你：{title_suffix}"
+    title, body = build_message(event, payload)
     try:
         attempted, ok, reason, error = push_with_gates(cfg, event, title, body, urgency, timeout)
     except Exception as exc:  # noqa: BLE001 - 绝不让异常穿给 hook

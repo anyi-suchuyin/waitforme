@@ -32,9 +32,8 @@ _append_lock = threading.Lock()
 
 HERE = Path(__file__).resolve().parent
 NET_TIMEOUT_S = 10
-CLOSER = "[👉 在系统浏览器打开]({url})"
-LINK_HINT = ("微信/企业微信内置浏览器打不开这个页面：点右上角「···」→「在浏览器打开」，"
-             "或长按复制下面的链接到 Safari / Chrome：\n{url}")
+CLOSER = "[👉 在浏览器打开]({url})"
+LINK_HINT = "打不开就点右上角「···」→「在浏览器打开」，或长按复制：{url}"
 NO_LINK_NOTE = "> 本次没有可用跳转链接，请回到电脑前操作"
 VALID_CHANNELS = ("mock", "wecom_bot", "feishu", "pushplus")
 
