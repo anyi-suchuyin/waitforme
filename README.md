@@ -43,9 +43,46 @@ python hooks.py stop
 自测（默认离线，不联网、不污染真实 `logs/`；含 40 线程并发写与 8 并发 hook 的回归）：
 
 ```bash
-python selftest.py          # 167 项断言，全绿退出 0
+python selftest.py          # 272 项断言，全绿退出 0
 python selftest.py --live   # 再真发一条；通道没配就 SKIP
 ```
+
+## 作为 Skill 安装（交给 AI 助手）
+
+仓库里的 `skill/` 目录是一个符合 Agent Skills 规范的安装包：`SKILL.md` + 安装/配置/验证脚本。
+装好后，**新会话**里说一句「安装 waitforme skill」或「配置 waitforme」，AI 就会自己读流程往下做。
+
+**放哪儿**（目录名建议 `waitforme`，与 frontmatter 里的 `name` 一致）：
+
+| 场景 | 路径 |
+|---|---|
+| Kimi Code（用户级，所有项目可用） | `~/.kimi-code/skills/waitforme/` |
+| Kimi Code（项目级） | `<项目>/.kimi-code/skills/waitforme/` 或 `<项目>/.agents/skills/waitforme/` |
+| Claude Code | `~/.claude/skills/waitforme/` |
+
+注意：Kimi Code 扫描的是 `.kimi-code/skills/` 和 `.agents/skills/`；`.kimi/skills/` 不会被扫到。
+
+```bash
+# bash / Git Bash
+mkdir -p ~/.kimi-code/skills
+cp -r skill ~/.kimi-code/skills/waitforme
+ls ~/.kimi-code/skills/            # 看到 waitforme 就说明放对了
+
+# PowerShell
+New-Item -ItemType Directory -Force "$HOME\.kimi-code\skills" | Out-Null
+Copy-Item -Recurse skill "$HOME\.kimi-code\skills\waitforme"
+```
+
+**手动跑也就两条命令**（`$HOME` 在 bash 和 PowerShell 里都认）：
+
+```bash
+python "$HOME/.kimi-code/skills/waitforme/scripts/install.py"            # 找项目 → init → 选通道
+python "$HOME/.kimi-code/skills/waitforme/scripts/verify.py" --service   # 含 272 项自检
+```
+
+如果只复制了 `skill/`、本机又没有 waitforme 仓库，安装器会提示三选一：`--project <目录>`、
+`--clone`（克隆到 `~/waitforme`）、或手动 clone。把 hook 接到 Kimi Code 那一步**不会自动改配置**：
+`connect_kimi.py` 只打印 `[[hooks]]` 片段和可直接 review 的 patch，写不写由你决定。
 
 ## 三个微信通道，选一个
 
@@ -120,7 +157,7 @@ channels.py        四个通道适配器，统一 send(...) -> {"ok","channel","
 linker.py          从 ~/.kimi-code/server/rc.json 读远程控制链接，读不到退 fallback
 policy.py          事件策略 / 限流 / 静默时段 / 内容指纹（纯函数，好单测）
 config.example.json 配置模板（config.json 由 init 生成，已被 gitignore）
-selftest.py        160 项离线断言 + 可选 --live
+selftest.py        272 项离线断言 + 可选 --live
 ```
 
 运行时产物（都不进版本库）：
