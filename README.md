@@ -12,9 +12,25 @@ git clone https://github.com/anyi-suchuyin/waitforme.git
 cd waitforme
 ```
 
-也可下载 ZIP 解压。建议配合部署指南 PDF（小红书评论区/网盘）一起丢给你的 AI 编程助手安装。
+也可下载 ZIP 解压。
 
-## 5 分钟上手
+## 作为 Agent Skill 安装（推荐）
+
+```bash
+# 把 skill/ 放进 Kimi Code 的技能目录（目录名必须是 waitforme）
+mkdir -p ~/.kimi-code/skills
+cp -r skill ~/.kimi-code/skills/waitforme
+```
+
+然后**开新会话**，说一句「安装 waitforme skill」。AI 会按 `skill/SKILL.md` 自己跑：
+体检 → 生成配置 → 问通道 key → 真发一条 → 打印 hook 片段。
+
+hook 默认走**零常驻直发**：事件来了起一个短命进程，过三道门（去重/静默/限流）后发微信，
+发完就退出，不需要 `hooks.py serve` 一直挂着。
+
+配合 `资料/waitforme部署指南.pdf`（Skill 安装指南）一起丢给 AI 更省事。
+
+## 手动 5 分钟上手
 
 ```bash
 # 在 waitforme 项目目录下：
